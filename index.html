@@ -51,6 +51,45 @@
       -webkit-tap-highlight-color:transparent;
     }
     a{color:inherit}
+
+    .authGate{
+      position:fixed;
+      inset:0;
+      z-index:9999;
+      display:none;
+      align-items:center;
+      justify-content:center;
+      padding:18px;
+      background:
+        radial-gradient(circle at top, rgba(216,175,84,.14), transparent 30%),
+        linear-gradient(180deg, rgba(2,2,2,.97), rgba(8,7,6,.98));
+      backdrop-filter:blur(14px);
+    }
+    body.auth-locked .authGate{display:flex;}
+    body.auth-locked .app{display:none;}
+    .authCard{
+      width:min(520px,100%);
+      border:1px solid var(--line);
+      border-radius:30px;
+      padding:24px;
+      background:linear-gradient(180deg, rgba(18,16,14,.98), rgba(10,9,8,.98));
+      box-shadow:var(--shadow);
+    }
+    .authHead{display:flex;align-items:center;gap:14px;margin-bottom:18px}
+    .authHead .brandMark{width:62px;height:62px;flex:0 0 auto}
+    .authTitle{margin:0;font-size:clamp(24px,4vw,36px);line-height:1;letter-spacing:.04em;text-transform:uppercase}
+    .authSub{margin:8px 0 0;color:var(--muted);font-size:13px;line-height:1.5}
+    .authForm{display:flex;flex-direction:column;gap:12px;margin-top:18px}
+    .authGrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    .authStatus{min-height:20px;color:#f1d79b;font-size:13px;line-height:1.4}
+    .authActions{display:flex;gap:10px;flex-wrap:wrap}
+    .authActions .pill{justify-content:center;flex:1 1 180px}
+    .authTiny{color:var(--muted2);font-size:12px;line-height:1.5}
+    .authError{color:var(--bad)}
+    @media (max-width: 560px){
+      .authCard{padding:18px;border-radius:24px}
+      .authGrid{grid-template-columns:1fr}
+    }
     .app{
       max-width:1600px;
       margin:0 auto;
@@ -1398,7 +1437,41 @@
     }
 </style>
 </head>
-<body>
+<body class="auth-locked">
+<div id="authGate" class="authGate">
+  <div class="authCard">
+    <div class="authHead">
+      <div class="brandMark">1911</div>
+      <div>
+        <h1 class="authTitle">1911 Café POS</h1>
+        <p class="authSub">Sign in with your Firebase staff account to access the café POS.</p>
+      </div>
+    </div>
+
+    <div class="authStatus" id="authStatus">Connecting to Firebase...</div>
+
+    <form class="authForm" id="authForm">
+      <div class="authGrid">
+        <div>
+          <div class="subtle" style="margin-bottom:6px">Email</div>
+          <input class="input" id="authEmail" type="email" autocomplete="email" placeholder="staff@1911cafe.com" required />
+        </div>
+        <div>
+          <div class="subtle" style="margin-bottom:6px">Password</div>
+          <input class="input" id="authPassword" type="password" autocomplete="current-password" placeholder="••••••••" required />
+        </div>
+      </div>
+      <div class="authActions">
+        <button class="pill primary" id="authSubmit" type="submit">Sign in</button>
+        <button class="pill ghost" type="button" id="authRetry">Retry connection</button>
+      </div>
+      <div class="authTiny">
+        Use your Firebase Authentication email/password account. The POS keeps localStorage data intact.
+      </div>
+    </form>
+  </div>
+</div>
+
 <div class="app">
   <header class="topbar">
     <div class="brand">
@@ -1414,6 +1487,7 @@
       <button class="pill ghost" id="menuButton" onclick="window.__1911.openMenuHub()">📖 Menu</button>
       <button class="pill ghost" id="historyButton" onclick="window.__1911.openHistoryHub()">🕒 History</button>
       <button class="pill ghost" id="takeawayButton">🧾 Takeaway</button>
+      <button class="pill ghost" id="logoutButton" style="display:none">🚪 Logout</button>
       <button class="pill primary" id="adminButton">⚙️ Admin</button>
     </div>
   </header>
@@ -1831,12 +1905,67 @@
     saveState();
   }
 
+  function getAuthSession() {
+    return window.__1911AuthSession || null;
+  }
+
+  function normalizeRole(role) {
+    return String(role || '').trim().toUpperCase();
+  }
+
   function getCurrentStaff() {
+    const authSession = getAuthSession();
+    if (authSession?.staff) return authSession.staff;
     return state.staff.find(s => s.id === state.currentStaffId) || state.staff[0];
   }
 
+  function getCurrentRole() {
+    const authSession = getAuthSession();
+    const authRole = normalizeRole(authSession?.role || authSession?.staff?.role || '');
+    if (authRole) return authRole;
+    return normalizeRole(getCurrentStaff()?.role || '');
+  }
+
   function isOwner() {
-    return (getCurrentStaff()?.role || '') === 'OWNER';
+    return getCurrentRole() === 'OWNER';
+  }
+
+  function canAccessAdmin() {
+    const role = getCurrentRole();
+    return role === 'OWNER' || role === 'MANAGER';
+  }
+
+  function syncAuthenticatedStaff(profile) {
+    if (!profile) return null;
+    const uid = String(profile.uid || '').trim();
+    if (!uid) return null;
+    const name = String(profile.name || profile.email || 'Staff').trim() || 'Staff';
+    const email = String(profile.email || '').trim();
+    const role = normalizeRole(profile.role || 'STAFF') || 'STAFF';
+    const active = profile.active !== false;
+    const mirror = {
+      id: uid,
+      name,
+      email,
+      role,
+      active,
+      firebaseUid: uid
+    };
+    const existing = state.staff.findIndex(s => s.id === uid);
+    if (existing >= 0) state.staff[existing] = { ...state.staff[existing], ...mirror };
+    else state.staff.push(mirror);
+    state.currentStaffId = uid;
+    saveState();
+    renderAll();
+    return mirror;
+  }
+
+  function clearAuthenticatedSession() {
+    window.__1911AuthSession = null;
+    const fallback = state.staff.find(s => s.active !== false) || state.staff[0] || null;
+    state.currentStaffId = fallback?.id || null;
+    saveState();
+    renderAll();
   }
 
   function formatMoney(value) {
@@ -2360,8 +2489,12 @@
       paymentMethod: null,
       cashReceived: 0,
       changeDue: 0,
-      staffCreatedId: state.currentStaffId,
-      staffPaidId: null
+      staffCreatedId: getCurrentStaff()?.id || state.currentStaffId,
+      staffCreatedName: getCurrentStaff()?.name || '—',
+      staffCreatedRole: getCurrentStaff()?.role || '—',
+      staffPaidId: null,
+      staffPaidName: null,
+      staffPaidRole: null
     };
     state.activeOrders.unshift(order);
     if (tableId) {
@@ -2407,6 +2540,7 @@
     $('discountButton').addEventListener('click', openDiscountModal);
     $('checkoutButton').addEventListener('click', openCheckoutModal);
     $('closeOrderButton').addEventListener('click', closeCurrentOrder);
+    if ($('logoutButton')) $('logoutButton').addEventListener('click', () => window.__1911Auth?.logout?.());
     $('modalCloseButton').addEventListener('click', closeModal);
     $('modal').addEventListener('click', (e) => {
       if (e.target === $('modal')) closeModal();
@@ -2430,6 +2564,11 @@
 
   function renderHeaderState() {
     const staff = getCurrentStaff();
+    const role = getCurrentRole();
+    const canAdmin = role === 'OWNER' || role === 'MANAGER';
+    if ($('staffButton')) $('staffButton').style.display = canAdmin ? '' : 'none';
+    if ($('adminButton')) $('adminButton').style.display = canAdmin ? '' : 'none';
+    if ($('logoutButton')) $('logoutButton').style.display = getAuthSession() ? '' : 'none';
     $('staffButtonLabel').textContent = `${staff?.name || 'Owner'} · ${staff?.role || 'OWNER'}`;
     const shiftLabel = state.settings.shiftLabel || '5:00 PM – 2:00 AM';
     const onDuty = state.staff.filter(s => s.active !== false);
@@ -2447,6 +2586,7 @@
   }
 
   function renderStats() {
+
     const todayOrders = ordersInRange('today');
     const weekOrders = ordersInRange('week');
     const monthOrders = ordersInRange('month');
@@ -2781,9 +2921,9 @@
       </div>
       ${i.note ? `<div class="historyMeta" style="margin-top:-2px">Item note: ${escapeHtml(i.note)}</div>` : ''}
     `).join('');
-    const staff = state.staff.find(s => s.name === (order.staffPaidName || order.staffCreatedName || ''));
+    const staff = state.staff.find(s => s.id === (order.staffPaidId || order.staffCreatedId || '') || s.name === (order.staffPaidName || order.staffCreatedName || ''));
     const staffName = escapeHtml(order.staffPaidName || order.staffCreatedName || '—');
-    const staffRole = escapeHtml(staff?.role || '—');
+    const staffRole = escapeHtml(order.staffPaidRole || order.staffCreatedRole || staff?.role || '—');
     const orderNote = order.notes ? `<div class="historyMeta">Order note: ${escapeHtml(order.notes)}</div>` : '';
     return `
       <button class="historyItem" onclick="window.__1911.openReceipt('${order.id}')">
@@ -3054,8 +3194,10 @@
     order.paymentMethod = paymentMethod;
     order.cashReceived = Number(cashReceived || 0);
     order.changeDue = paymentMethod === 'Cash' ? Math.max(0, order.cashReceived - order.total) : 0;
-    order.staffPaidId = state.currentStaffId;
-    order.staffPaidName = getCurrentStaff()?.name || '—';
+    const payingStaff = getCurrentStaff();
+    order.staffPaidId = payingStaff?.id || state.currentStaffId;
+    order.staffPaidName = payingStaff?.name || '—';
+    order.staffPaidRole = payingStaff?.role || '—';
     order.paidAt = Date.now();
     order.updatedAt = Date.now();
 
@@ -3148,7 +3290,7 @@
           Paid: ${formatDateTime(order.paidAt || order.createdAt)}<br>
           Payment: ${escapeHtml(order.paymentMethod || '—')}<br>
           Staff: ${escapeHtml(order.staffPaidName || order.staffCreatedName || '—')}<br>
-          Role: ${escapeHtml((state.staff.find(s => s.name === (order.staffPaidName || order.staffCreatedName || '')) || {}).role || '—')}
+          Role: ${escapeHtml(order.staffPaidRole || order.staffCreatedRole || (state.staff.find(s => s.name === (order.staffPaidName || order.staffCreatedName || '')) || {}).role || '—')}
         </div>
         ${order.notes ? `<div class="receiptMeta" style="margin-top:10px">Order note: ${escapeHtml(order.notes)}</div>` : ''}
         <div class="receiptList">
@@ -3227,6 +3369,10 @@
   }
 
   function openAdmin() {
+    if (!canAccessAdmin()) {
+      toast('Access denied.');
+      return;
+    }
     const tabs = ownerTabs();
     state.adminTab = tabs.includes(state.adminTab) ? state.adminTab : tabs[0];
     saveState();
@@ -3235,9 +3381,10 @@
   }
 
   function ownerTabs() {
-    const tabs = ['products', 'categories', 'tables', 'inventory', 'reports'];
-    if (isOwner()) tabs.push('staff', 'settings');
-    return tabs;
+    const role = getCurrentRole();
+    if (role === 'OWNER') return ['products', 'categories', 'tables', 'inventory', 'reports', 'staff', 'settings'];
+    if (role === 'MANAGER') return ['products', 'categories', 'tables', 'inventory', 'reports'];
+    return [];
   }
 
   function renderAdmin() {
@@ -4412,6 +4559,7 @@ function quickSwitchStaff(id) {
 
   // Expose controlled API for inline handlers
   window.__1911 = {
+    renderAll,
     selectTable,
     selectCategory,
     addProduct,
@@ -4456,7 +4604,9 @@ function quickSwitchStaff(id) {
     markOrderSent,
     openAdmin,
     openStaffSwitcher,
-    closeCurrentOrder
+    closeCurrentOrder,
+    syncAuthenticatedStaff,
+    clearAuthenticatedSession
   };
 
   // map missing functions to stateful actions
@@ -5009,5 +5159,436 @@ function payOrCloseTakeaway() {
 
 })();
 </script>
+
+<script>
+(function init1911FirebaseFoundation() {
+  if (window.__1911Firebase && window.__1911Firebase.phase === 'foundation') return;
+
+  const FIREBASE_CONFIG = {
+    apiKey: "AIzaSyB_m-lt22FJ7fShyRHDgPEbkYTSOzMpMYM",
+    authDomain: "menu-e4cef.firebaseapp.com",
+    projectId: "menu-e4cef",
+    storageBucket: "menu-e4cef.firebasestorage.app",
+    messagingSenderId: "686608343620",
+    appId: "1:686608343620:web:cbcf3c2c4e149caaee9211",
+    measurementId: "G-RDY676HQLB"
+  };
+
+  const BUSINESS_ID = "1911-cafe";
+  const state = {
+    phase: "foundation",
+    status: "idle",
+    ready: false,
+    error: null,
+    app: null,
+    db: null,
+    refs: null,
+    firestore: null,
+    auth: null,
+    authState: { status: 'booting', user: null, error: null, ready: false, role: null, staff: null },
+    initPromise: null,
+    config: FIREBASE_CONFIG,
+    businessId: BUSINESS_ID,
+    projectId: FIREBASE_CONFIG.projectId,
+    collectionPaths: {
+      products: `businesses/${BUSINESS_ID}/products`,
+      categories: `businesses/${BUSINESS_ID}/categories`,
+      tables: `businesses/${BUSINESS_ID}/tables`,
+      inventory: `businesses/${BUSINESS_ID}/inventory`,
+      recipes: `businesses/${BUSINESS_ID}/recipes`,
+      staff: `businesses/${BUSINESS_ID}/staff`,
+      shifts: `businesses/${BUSINESS_ID}/shifts`,
+      activeTableOrders: `businesses/${BUSINESS_ID}/activeTableOrders`,
+      activeTakeawayOrders: `businesses/${BUSINESS_ID}/activeTakeawayOrders`,
+      completedOrders: `businesses/${BUSINESS_ID}/completedOrders`,
+      transactions: `businesses/${BUSINESS_ID}/transactions`,
+      reports: `businesses/${BUSINESS_ID}/reports`,
+      settings: `businesses/${BUSINESS_ID}/settings`,
+      revenue: `businesses/${BUSINESS_ID}/revenue`
+    }
+  };
+
+  window.__1911Firebase = state;
+
+  state.initPromise = (async () => {
+    try {
+      const [appMod, firestoreMod, authMod] = await Promise.all([
+        import("https://www.gstatic.com/firebasejs/10.13.2/firebase-app.js"),
+        import("https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore.js"),
+        import("https://www.gstatic.com/firebasejs/10.13.2/firebase-auth.js")
+      ]);
+
+      // Single Firebase initialization path.
+      // Auth and Firestore are created from the exact same DEFAULT app.
+      const { initializeApp } = appMod;
+      const {
+        getFirestore,
+        collection,
+        doc,
+        serverTimestamp,
+        Timestamp,
+        increment,
+        query,
+        where,
+        orderBy,
+        limit,
+        onSnapshot,
+        getDoc,
+        getDocs,
+        getDocFromServer,
+        getDocsFromServer,
+        documentId,
+        setDoc,
+        updateDoc,
+        addDoc,
+        deleteDoc,
+        runTransaction
+      } = firestoreMod;
+      const {
+        getAuth,
+        setPersistence,
+        browserLocalPersistence,
+        onAuthStateChanged,
+        signInWithEmailAndPassword,
+        signOut
+      } = authMod;
+
+      const app = initializeApp(FIREBASE_CONFIG);
+      const auth = getAuth(app);
+      const db = getFirestore(app);
+
+      if (app.options.projectId !== FIREBASE_CONFIG.projectId) {
+        throw new Error(
+          `Firebase project mismatch: expected ${FIREBASE_CONFIG.projectId}, got ${app.options.projectId || 'unknown'}`
+        );
+      }
+
+      if (app.options.appId !== FIREBASE_CONFIG.appId) {
+        throw new Error(
+          `Firebase App ID mismatch: expected ${FIREBASE_CONFIG.appId}, got ${app.options.appId || 'unknown'}`
+        );
+      }
+
+      state.app = app;
+      state.db = db;
+      state.refs = {
+        root: doc(db, "businesses", BUSINESS_ID),
+        products: collection(db, "businesses", BUSINESS_ID, "products"),
+        categories: collection(db, "businesses", BUSINESS_ID, "categories"),
+        tables: collection(db, "businesses", BUSINESS_ID, "tables"),
+        inventory: collection(db, "businesses", BUSINESS_ID, "inventory"),
+        recipes: collection(db, "businesses", BUSINESS_ID, "recipes"),
+        staff: collection(db, "businesses", BUSINESS_ID, "staff"),
+        shifts: collection(db, "businesses", BUSINESS_ID, "shifts"),
+        activeTableOrders: collection(db, "businesses", BUSINESS_ID, "activeTableOrders"),
+        activeTakeawayOrders: collection(db, "businesses", BUSINESS_ID, "activeTakeawayOrders"),
+        completedOrders: collection(db, "businesses", BUSINESS_ID, "completedOrders"),
+        transactions: collection(db, "businesses", BUSINESS_ID, "transactions"),
+        reports: collection(db, "businesses", BUSINESS_ID, "reports"),
+        settings: collection(db, "businesses", BUSINESS_ID, "settings"),
+        revenue: collection(db, "businesses", BUSINESS_ID, "revenue")
+      };
+
+      state.firestore = {
+        collection,
+        doc,
+        serverTimestamp,
+        Timestamp,
+        increment,
+        query,
+        where,
+        orderBy,
+        limit,
+        onSnapshot,
+        getDoc,
+        getDocs,
+        getDocFromServer,
+        getDocsFromServer,
+        setDoc,
+        updateDoc,
+        addDoc,
+        deleteDoc,
+        runTransaction
+      };
+
+      state.auth = auth;
+      window.__1911Auth = window.__1911Auth || {};
+      window.__1911Auth.auth = auth;
+      window.__1911Auth.logout = async () => {
+        try {
+          await signOut(auth);
+        } catch (error) {
+          state.authState.error = 'Could not sign out right now.';
+          updateAuthGate({ status: 'error', message: state.authState.error });
+        }
+      };
+      window.__1911Auth.login = async (email, password) => {
+        return signInWithEmailAndPassword(auth, email, password);
+      };
+
+      const authGate = document.getElementById('authGate');
+      const authStatus = document.getElementById('authStatus');
+      const authForm = document.getElementById('authForm');
+      const authEmail = document.getElementById('authEmail');
+      const authPassword = document.getElementById('authPassword');
+      const authSubmit = document.getElementById('authSubmit');
+      const authRetry = document.getElementById('authRetry');
+      const logoutButton = document.getElementById('logoutButton');
+
+      function setLocked(locked) {
+        document.body.classList.toggle('auth-locked', locked);
+      }
+
+      function updateAuthGate({ status = 'loading', message = '', error = false } = {}) {
+        if (authStatus) {
+          authStatus.textContent = message || '';
+          authStatus.classList.toggle('authError', !!error);
+        }
+        if (authSubmit) authSubmit.disabled = status === 'loading';
+        if (authRetry) authRetry.disabled = status === 'loading';
+      }
+
+      function showLogin(message = '', isError = false) {
+        setLocked(true);
+        if (logoutButton) logoutButton.style.display = 'none';
+        updateAuthGate({
+          status: isError ? 'error' : 'signed-out',
+          message: message || state.authState.error || 'Sign in with your Firebase staff account.',
+          error: isError || !!state.authState.error
+        });
+        if (authEmail) setTimeout(() => authEmail.focus({ preventScroll: true }), 50);
+      }
+
+      function showApp() {
+        setLocked(false);
+        if (logoutButton) logoutButton.style.display = '';
+      }
+
+      async function loadStaffProfile(user) {
+        const uid = String(user?.uid || '').trim();
+        if (!uid) {
+          throw new Error("Firebase authentication did not provide a valid UID.");
+        }
+
+        // Staff identity is always resolved from the authenticated Firebase UID.
+        // getDocFromServer() is intentional here: it bypasses any stale local
+        // Firestore cache so the POS verifies the actual (default) database.
+        const staffPath = `businesses/${BUSINESS_ID}/staff/${uid}`;
+
+        console.log("=== FIREBASE STAFF FORENSIC CHECK ===");
+        console.log("Firebase project:", app?.options?.projectId || "");
+        console.log("Firebase App ID:", app?.options?.appId || "");
+        console.log("Firebase authDomain:", app?.options?.authDomain || "");
+        console.log("Authenticated UID:", uid);
+        console.log(
+          "Firestore database:",
+          db?._databaseId?.database || "(default)"
+        );
+        console.log("Staff path:", staffPath);
+
+        const staffRef = doc(
+          db,
+          "businesses",
+          BUSINESS_ID,
+          "staff",
+          uid
+        );
+
+        let staffSnap;
+        try {
+          staffSnap = await getDocFromServer(staffRef);
+        } catch (error) {
+          console.error("STAFF PROFILE FIRESTORE ERROR");
+          console.error("Error name:", error?.name || "unknown");
+          console.error("Error code:", error?.code || "unknown");
+          console.error("Error message:", error?.message || "unknown");
+
+          const code = String(error?.code || "");
+          if (code.includes("permission-denied")) {
+            throw new Error(
+              "Your Firebase account is authenticated, but Firestore denied access to your 1911 staff profile."
+            );
+          }
+          if (code.includes("unavailable") || code.includes("network")) {
+            throw new Error(
+              "Firestore is temporarily unavailable. Please check your connection and try again."
+            );
+          }
+          throw new Error(
+            `Could not read the 1911 staff profile from Firestore (${code || "unknown error"}).`
+          );
+        }
+
+        console.log("Direct getDocFromServer succeeded:", true);
+        console.log("Staff document exists:", staffSnap.exists());
+
+        if (!staffSnap.exists()) {
+          console.error("STAFF DOCUMENT NOT FOUND ON FIRESTORE SERVER");
+          console.error("Project:", app?.options?.projectId || "");
+          console.error("Database:", db?._databaseId?.database || "(default)");
+          console.error("Exact path:", staffPath);
+
+          throw new Error(
+            `No 1911 staff profile was found for Firebase UID ${uid} at ${staffPath}.`
+          );
+        }
+
+        const staffData = staffSnap.data() || {};
+        const role = normalizeRole(staffData.role);
+        const active = staffData.active;
+
+        console.log("Staff data:", staffData);
+        console.log("Staff role:", role);
+        console.log("Staff active:", active);
+
+        if (!role || !["OWNER", "MANAGER", "STAFF", "WAITER"].includes(role)) {
+          throw new Error(
+            "Your 1911 staff profile exists, but its role is invalid or missing."
+          );
+        }
+
+        if (active !== true) {
+          throw new Error(
+            "Your 1911 staff profile exists, but the account is inactive."
+          );
+        }
+
+        const staff = {
+          ...staffData,
+          uid,
+          role,
+          active: true,
+          email: staffData.email || user.email || ""
+        };
+
+        window.__1911AuthSession = {
+          uid,
+          email: user.email || staff.email || "",
+          role,
+          staff
+        };
+
+        state.authState = {
+          status: "authenticated",
+          user: {
+            uid,
+            email: user.email || staff.email || ""
+          },
+          error: null,
+          ready: true,
+          role,
+          staff
+        };
+
+        console.log("=== FIREBASE STAFF FORENSIC CHECK PASSED ===");
+
+        showApp();
+
+        // Preserve the existing POS staff identity behavior. We do not migrate
+        // or overwrite the local staff collection during this phase.
+        try {
+          const localMatch = state.staff.find(
+            s => String(s?.id || s?.uid || "") === uid
+          );
+          if (localMatch) {
+            state.currentStaffId = localMatch.id;
+          }
+        } catch (error) {}
+
+        updateAdminVisibility();
+        renderAll();
+      }
+
+      try {
+        await setPersistence(auth, browserLocalPersistence);
+      } catch (persistenceError) {
+        state.authState.error = 'Could not enable persistent sign-in.';
+        updateAuthGate({ status: 'error', message: 'Firebase sign-in persistence is unavailable.', error: true });
+      }
+
+      if (authForm) {
+        authForm.addEventListener('submit', async (event) => {
+          event.preventDefault();
+          const email = String(authEmail?.value || '').trim();
+          const password = String(authPassword?.value || '');
+          if (!email || !password) return;
+          updateAuthGate({ status: 'loading', message: 'Signing in...' });
+          try {
+            await signInWithEmailAndPassword(auth, email, password);
+          } catch (error) {
+            const code = String(error?.code || '');
+            let message = 'Could not sign in. Please check your email and password.';
+            if (code.includes('network')) message = 'Connection problem. Please try again.';
+            if (code.includes('invalid-credential') || code.includes('wrong-password') || code.includes('user-not-found')) {
+              message = 'Email or password is incorrect.';
+            }
+            state.authState.error = message;
+            updateAuthGate({ status: 'error', message, error: true });
+          }
+        });
+      }
+
+      if (authRetry) {
+        authRetry.addEventListener('click', async () => {
+          updateAuthGate({ status: 'loading', message: 'Reconnecting...' });
+          try {
+            await setPersistence(auth, browserLocalPersistence);
+          } catch (error) {}
+          if (!auth.currentUser) showLogin();
+        });
+      }
+
+      onAuthStateChanged(auth, async (user) => {
+        try {
+          if (user) {
+            state.authState.user = { uid: user.uid, email: user.email || '' };
+            updateAuthGate({ status: 'loading', message: 'Loading staff profile...' });
+            await loadStaffProfile(user);
+            return;
+          }
+
+          window.__1911AuthSession = null;
+          if (window.__1911?.clearAuthenticatedSession) {
+            window.__1911.clearAuthenticatedSession();
+          }
+          const priorError = state.authState.error || null;
+          state.authState = { status: 'signed-out', user: null, error: priorError, ready: true, role: null, staff: null };
+          showLogin(priorError || 'Sign in with your Firebase staff account.', !!priorError);
+        } catch (authError) {
+          const message = authError?.message || 'Could not load your staff profile.';
+          window.__1911AuthSession = null;
+          if (window.__1911?.clearAuthenticatedSession) {
+            window.__1911.clearAuthenticatedSession();
+          }
+          state.authState = { status: 'error', user: null, error: message, ready: true, role: null, staff: null };
+          updateAuthGate({ status: 'error', message, error: true });
+          showLogin(message, true);
+          try { await signOut(auth); } catch (signOutError) {}
+        }
+      });
+
+      state.status = "ready";
+      state.ready = true;
+      return state;
+    } catch (error) {
+      state.status = "error";
+      state.ready = false;
+      state.error = error?.message || String(error);
+      const authStatus = document.getElementById('authStatus');
+      if (authStatus) {
+        authStatus.textContent = 'Firebase sign-in is unavailable right now.';
+        authStatus.classList.add('authError');
+      }
+      const authSubmit = document.getElementById('authSubmit');
+      const authRetry = document.getElementById('authRetry');
+      if (authSubmit) authSubmit.disabled = true;
+      if (authRetry) authRetry.disabled = false;
+      document.body.classList.add('auth-locked');
+      return state;
+    }
+  })();
+})();
+</script>
+
 </body>
 </html>
