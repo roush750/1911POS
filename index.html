@@ -1529,7 +1529,7 @@
       <div class="authActions">
         <button class="pill primary" id="authSubmit" type="submit">Sign In</button>
       </div>
-      <div class="authHint">This login uses Firebase Email/Password authentication. Your POS data stays in localStorage during this phase.</div>
+      <div class="authHint">This login uses Firebase Email/Password authentication. Business data is backed by Firestore after migration, with localStorage preserved as a local cache.</div>
     </form>
   </div>
 </div>
@@ -1693,7 +1693,16 @@
 <script type="module">
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js';
 import { getAuth, setPersistence, browserLocalPersistence, onAuthStateChanged, signInWithEmailAndPassword, signOut } from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js';
-import { getFirestore, doc, getDoc } from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js';
+import {
+  getFirestore,
+  doc,
+  getDoc,
+  collection,
+  getDocs,
+  setDoc,
+  deleteDoc,
+  writeBatch
+} from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js';
 
 const firebaseConfig = {
   apiKey: "AIzaSyB_m-lt22FJ7fShyRHDgPEbkYTSOzMpMYM",
@@ -1723,6 +1732,22 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   let uiBound = false;
   let processedAuthUid = null;
   let rolloverTimer = null;
+
+  // Phase 3 cloud persistence state. Firebase Auth remains the access-control
+  // layer; Firestore persistence is scoped to the authenticated UID.
+  const CLOUD_COLLECTIONS = ['categories', 'products', 'inventory', 'tables', 'activeOrders', 'orders'];
+  const CLOUD_ROOT_COLLECTION = '1911POS';
+  const CLOUD_META_DOC = 'migration';
+  const CLOUD_SETTINGS_DOC = 'main';
+  let cloudUserUid = null;
+  let cloudReady = false;
+  let cloudMigrationStatus = 'not-started';
+  let cloudStatusDetails = '';
+  let cloudSyncTimer = null;
+  let cloudSyncInFlight = false;
+  let cloudSyncDirty = false;
+  let cloudLastBusinessHash = '';
+  const cloudKnownIds = Object.fromEntries(CLOUD_COLLECTIONS.map(name => [name, new Set()]));
 
   const defaultState = () => ({
     settings: {
@@ -1853,7 +1878,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
   let state = loadState();
   migrateAndNormalize();
-  const table01RepairReport = repairTable01State();
   ensureCurrentStaff();
   bindEvents();
   prepareAuthScreen();
@@ -1872,10 +1896,589 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
   function saveState() {
     localStorage.setItem(STORE_KEY, JSON.stringify(state));
+
+    if (
+      cloudReady &&
+      cloudUserUid &&
+      cloudMigrationStatus === 'completed'
+    ) {
+      scheduleCloudSync();
+    }
   }
 
   function safeClone(v) {
     return JSON.parse(JSON.stringify(v));
+  }
+
+  // -------------------------------------------------------------------------
+  // Phase 3: Local business state <-> Firestore persistence
+  //
+  // Firestore is authoritative AFTER migration completes.
+  // localStorage remains the local cache/fallback and is never cleared.
+  //
+  // Stable IDs are the Firestore document IDs. There is no array-position
+  // matching and no local+cloud array concatenation.
+  //
+  // Staff PINs/authentication are intentionally NOT migrated.
+  // Product recipes are already embedded in product.recipe and travel with
+  // their product document.
+  // -------------------------------------------------------------------------
+
+  function getCloudRootRef(uidValue = cloudUserUid) {
+    if (!uidValue) return null;
+    return doc(db, CLOUD_ROOT_COLLECTION, uidValue);
+  }
+
+  function getCloudMetaRef(uidValue = cloudUserUid) {
+    const root = getCloudRootRef(uidValue);
+    return root ? doc(collection(root, 'meta'), CLOUD_META_DOC) : null;
+  }
+
+  function getCloudSettingsRef(uidValue = cloudUserUid) {
+    const root = getCloudRootRef(uidValue);
+    return root ? doc(collection(root, 'settings'), CLOUD_SETTINGS_DOC) : null;
+  }
+
+  function getCloudCollectionRef(collectionName, uidValue = cloudUserUid) {
+    const root = getCloudRootRef(uidValue);
+    return root ? collection(root, collectionName) : null;
+  }
+
+  function extractBusinessState() {
+    return {
+      settings: safeClone(state.settings || {}),
+      orderSequence: Number(state.orderSequence || 0),
+      categories: safeClone(Array.isArray(state.categories) ? state.categories : []),
+      products: safeClone(Array.isArray(state.products) ? state.products : []),
+      inventory: safeClone(Array.isArray(state.inventory) ? state.inventory : []),
+      tables: safeClone(Array.isArray(state.tables) ? state.tables : []),
+      activeOrders: safeClone(Array.isArray(state.activeOrders) ? state.activeOrders : []),
+      orders: safeClone(Array.isArray(state.orders) ? state.orders : [])
+    };
+  }
+
+  function stableStringify(value) {
+    if (value === null || typeof value !== 'object') return JSON.stringify(value);
+    if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
+  }
+
+  function getBusinessStateHash(snapshot = extractBusinessState()) {
+    return stableStringify(snapshot);
+  }
+
+  function businessCounts(snapshot) {
+    return {
+      categories: snapshot.categories.length,
+      products: snapshot.products.length,
+      inventory: snapshot.inventory.length,
+      tables: snapshot.tables.length,
+      activeOrders: snapshot.activeOrders.length,
+      orders: snapshot.orders.length
+    };
+  }
+
+  function totalBusinessRecordCount(counts) {
+    return CLOUD_COLLECTIONS.reduce((sum, key) => sum + Number(counts[key] || 0), 0);
+  }
+
+  function cloudStatusText() {
+    if (cloudMigrationStatus === 'completed') return 'Firestore connected · Migration complete';
+    if (cloudMigrationStatus === 'in-progress') return 'Firestore migration in progress...';
+    if (cloudMigrationStatus === 'failed') return 'Firestore migration failed · Local data preserved';
+    if (cloudStatusDetails) return cloudStatusDetails;
+    return 'Firestore persistence is ready for the first migration.';
+  }
+
+  function setCloudStatus(status, details = '') {
+    cloudMigrationStatus = status;
+    cloudStatusDetails = details || '';
+  }
+
+  async function readCloudBusinessState(uidValue = cloudUserUid) {
+    if (!uidValue) throw new Error('No authenticated Firebase UID is available.');
+
+    const result = {
+      settings: null,
+      categories: [],
+      products: [],
+      inventory: [],
+      tables: [],
+      activeOrders: [],
+      orders: [],
+      migration: null,
+      cloudCounts: {}
+    };
+
+    const settingsRef = getCloudSettingsRef(uidValue);
+    const metaRef = getCloudMetaRef(uidValue);
+
+    const settingsSnap = await getDoc(settingsRef);
+    const metaSnap = await getDoc(metaRef);
+
+    if (settingsSnap.exists()) result.settings = settingsSnap.data() || {};
+    if (metaSnap.exists()) result.migration = metaSnap.data() || {};
+
+    for (const collectionName of CLOUD_COLLECTIONS) {
+      const collectionRef = getCloudCollectionRef(collectionName, uidValue);
+      const snap = await getDocs(collectionRef);
+      const records = [];
+
+      snap.forEach(snapshot => {
+        const data = snapshot.data() || {};
+        records.push({
+          ...data,
+          id: data.id || snapshot.id
+        });
+      });
+
+      result[collectionName] = records;
+      result.cloudCounts[collectionName] = records.length;
+
+      cloudKnownIds[collectionName].clear();
+      records.forEach(record => {
+        if (record?.id) cloudKnownIds[collectionName].add(String(record.id));
+      });
+    }
+
+    return result;
+  }
+
+  function applyCloudBusinessState(cloudState) {
+    const localUi = {
+      currentStaffId: state.currentStaffId,
+      activeCategoryId: state.activeCategoryId,
+      currentOrderId: state.currentOrderId,
+      searchProducts: state.searchProducts,
+      searchHistory: state.searchHistory,
+      historyRange: state.historyRange,
+      reportMode: state.reportMode,
+      reportDate: state.reportDate,
+      reportMonth: state.reportMonth,
+      reportWeekStart: state.reportWeekStart,
+      adminTab: state.adminTab,
+      adminSelection: state.adminSelection,
+      adminProductCategoryId: state.adminProductCategoryId,
+      adminProductSearch: state.adminProductSearch,
+      adminCategorySearch: state.adminCategorySearch,
+      checkoutDraft: state.checkoutDraft,
+      showArchivedClosed: state.showArchivedClosed,
+      staff: state.staff
+    };
+
+    const fallbackSettings = defaultState().settings;
+    const cloudSettingsEnvelope = cloudState.settings || {};
+    const cloudSettings = cloudSettingsEnvelope.settings || cloudSettingsEnvelope;
+
+    // Cloud business data replaces local business arrays. This is deliberately
+    // NOT a merge operation, so the same logical entity cannot be duplicated.
+    state.settings = { ...fallbackSettings, ...safeClone(cloudSettings || {}) };
+    state.categories = safeClone(cloudState.categories || []);
+    state.products = safeClone(cloudState.products || []);
+    state.inventory = safeClone(cloudState.inventory || []);
+    state.tables = safeClone(cloudState.tables || []);
+    state.activeOrders = safeClone(cloudState.activeOrders || []);
+    state.orders = safeClone(cloudState.orders || []);
+    state.orderSequence = Number(
+      cloudSettingsEnvelope.orderSequence ||
+      state.orderSequence ||
+      0
+    );
+
+    Object.assign(state, localUi);
+
+    // Keep the existing normalization/relationship repair logic in place, but
+    // never create default business records over a successfully loaded cloud
+    // collection.
+    migrateAndNormalize();
+
+    // A cloud order history is authoritative after migration. Do not restore
+    // a paid historical order into the UI selection.
+    if (state.currentOrderId) {
+      const current = getOrderById(state.currentOrderId);
+      if (!current || current.status === 'paid' || current.paymentStatus === 'paid') {
+        state.currentOrderId = null;
+      }
+    }
+
+    cloudLastBusinessHash = getBusinessStateHash();
+  }
+
+  function makeCloudRecord(collectionName, record) {
+    const cloned = safeClone(record || {});
+    const id = String(cloned.id || '').trim();
+    if (!id) throw new Error(`Cannot migrate a ${collectionName} record without a stable ID.`);
+    return { id, data: cloned };
+  }
+
+  async function writeRecordCollection(collectionName, records, options = {}) {
+    const uidValue = cloudUserUid;
+    if (!uidValue) throw new Error('No authenticated Firebase UID is available.');
+
+    const currentRecords = Array.isArray(records) ? records : [];
+    const localIds = new Set();
+
+    // Firestore limits a batch to 500 writes. Keep a safety margin.
+    let batch = writeBatch(db);
+    let operations = 0;
+
+    const commitBatch = async () => {
+      if (!operations) return;
+      await batch.commit();
+      batch = writeBatch(db);
+      operations = 0;
+    };
+
+    for (const rawRecord of currentRecords) {
+      const { id, data } = makeCloudRecord(collectionName, rawRecord);
+      localIds.add(id);
+      const ref = doc(getCloudCollectionRef(collectionName, uidValue), id);
+      batch.set(ref, data, { merge: true });
+      operations++;
+
+      if (operations >= 450) await commitBatch();
+    }
+
+    // During the first migration, unmatched cloud-only records are preserved.
+    // After migration, loaded cloud IDs are considered part of the authoritative
+    // collection and local deletions are propagated by removing missing IDs.
+    if (options.reconcileDeletes) {
+      for (const existingId of cloudKnownIds[collectionName]) {
+        if (!localIds.has(existingId)) {
+          const ref = doc(getCloudCollectionRef(collectionName, uidValue), existingId);
+          batch.delete(ref);
+          operations++;
+          if (operations >= 450) await commitBatch();
+        }
+      }
+    }
+
+    await commitBatch();
+
+    cloudKnownIds[collectionName].clear();
+    localIds.forEach(id => cloudKnownIds[collectionName].add(id));
+  }
+
+  async function writeCloudBusinessState(snapshot, options = {}) {
+    if (!cloudUserUid) throw new Error('No authenticated Firebase UID is available.');
+
+    const settingsRef = getCloudSettingsRef(cloudUserUid);
+    await setDoc(settingsRef, {
+      settings: safeClone(snapshot.settings || {}),
+      orderSequence: Number(snapshot.orderSequence || 0)
+    }, { merge: true });
+
+    for (const collectionName of CLOUD_COLLECTIONS) {
+      await writeRecordCollection(
+        collectionName,
+        snapshot[collectionName],
+        { reconcileDeletes: Boolean(options.reconcileDeletes) }
+      );
+    }
+  }
+
+  async function verifyCloudBusinessState(snapshot, uidValue = cloudUserUid) {
+    const cloud = await readCloudBusinessState(uidValue);
+
+    const expected = businessCounts(snapshot);
+    const actual = cloudCountsFromCloudState(cloud);
+
+    for (const collectionName of CLOUD_COLLECTIONS) {
+      if (actual[collectionName] < expected[collectionName]) {
+        throw new Error(
+          `Migration verification failed for ${collectionName}: expected at least ${expected[collectionName]} records, found ${actual[collectionName]}.`
+        );
+      }
+
+      const expectedById = new Map(
+        (snapshot[collectionName] || []).map(record => [String(record.id), record])
+      );
+      const actualById = new Map(
+        (cloud[collectionName] || []).map(record => [String(record.id), record])
+      );
+
+      for (const [id, expectedRecord] of expectedById) {
+        const actualRecord = actualById.get(id);
+        if (!actualRecord) {
+          throw new Error(`Migration verification failed: ${collectionName}/${id} was not found.`);
+        }
+
+        if (stableStringify(expectedRecord) !== stableStringify(actualRecord)) {
+          throw new Error(`Migration verification failed: ${collectionName}/${id} does not match the local source.`);
+        }
+      }
+    }
+
+    const cloudSettingsEnvelope = cloud.settings || {};
+    const localSettingsEnvelope = {
+      settings: snapshot.settings,
+      orderSequence: Number(snapshot.orderSequence || 0)
+    };
+
+    if (stableStringify(localSettingsEnvelope) !== stableStringify({
+      settings: cloudSettingsEnvelope.settings || {},
+      orderSequence: Number(cloudSettingsEnvelope.orderSequence || 0)
+    })) {
+      throw new Error('Migration verification failed for business settings.');
+    }
+
+    return {
+      cloud,
+      counts: actual
+    };
+  }
+
+  function cloudCountsFromCloudState(cloudState) {
+    return Object.fromEntries(
+      CLOUD_COLLECTIONS.map(collectionName => [
+        collectionName,
+        Array.isArray(cloudState[collectionName]) ? cloudState[collectionName].length : 0
+      ])
+    );
+  }
+
+  async function readMigrationStatus(uidValue = cloudUserUid) {
+    if (!uidValue) return { exists: false, data: null };
+
+    const metaRef = getCloudMetaRef(uidValue);
+    const snap = await getDoc(metaRef);
+    return {
+      exists: snap.exists(),
+      data: snap.exists() ? (snap.data() || {}) : null
+    };
+  }
+
+  async function prepareCloudSession(uidValue) {
+    cloudUserUid = uidValue;
+    cloudReady = false;
+    setCloudStatus('not-started', 'Checking Firestore persistence...');
+
+    const migration = await readMigrationStatus(uidValue);
+
+    if (migration.exists && migration.data?.status === 'completed') {
+      const cloud = await readCloudBusinessState(uidValue);
+      applyCloudBusinessState(cloud);
+      setCloudStatus(
+        'completed',
+        `Firestore connected · ${totalBusinessRecordCount(cloudCountsFromCloudState(cloud))} business records loaded`
+      );
+      cloudReady = true;
+      cloudLastBusinessHash = getBusinessStateHash();
+      return;
+    }
+
+    // Migration has not completed. Keep localStorage as the source and inspect
+    // Firestore only enough to tell the owner whether pre-existing cloud data exists.
+    const cloud = await readCloudBusinessState(uidValue);
+    const cloudTotal = totalBusinessRecordCount(cloudCountsFromCloudState(cloud));
+
+    if (cloudTotal > 0) {
+      setCloudStatus(
+        'not-started',
+        `Firestore contains ${cloudTotal} existing records · review before migration`
+      );
+    } else {
+      setCloudStatus('not-started', 'Firestore is empty · local POS data is ready to migrate');
+    }
+  }
+
+  async function migrateLocalBusinessToFirestore() {
+    if (!auth.currentUser?.uid) {
+      toast('Please sign in before migrating the POS to Firestore.');
+      return;
+    }
+    if (!isOwner()) {
+      toast('Only the OWNER account can run the Firestore migration.');
+      return;
+    }
+
+    setCloudStatus('in-progress', 'Reading local POS data and checking Firestore...');
+    renderAdmin();
+
+    const uidValue = auth.currentUser.uid;
+    cloudUserUid = uidValue;
+    const localSnapshot = extractBusinessState();
+    const localCounts = businessCounts(localSnapshot);
+
+    try {
+      // Read existing cloud state before writing. Matching IDs are updated,
+      // not duplicated. Cloud-only records are preserved during the initial
+      // migration rather than silently destroyed.
+      const before = await readCloudBusinessState(uidValue);
+
+      await setDoc(getCloudMetaRef(uidValue), {
+        status: 'in-progress',
+        source: 'localStorage:1911CafePOS:v1',
+        startedAt: Date.now(),
+        uid: uidValue
+      }, { merge: true });
+
+      await writeCloudBusinessState(localSnapshot, { reconcileDeletes: false });
+
+      const verification = await verifyCloudBusinessState(localSnapshot, uidValue);
+
+      await setDoc(getCloudMetaRef(uidValue), {
+        status: 'completed',
+        source: 'localStorage:1911CafePOS:v1',
+        completedAt: Date.now(),
+        uid: uidValue,
+        localCounts,
+        cloudCountsBefore: before.cloudCounts,
+        cloudCountsAfter: verification.counts,
+        cloudOnlyRecordsPreserved:
+          Math.max(
+            0,
+            totalBusinessRecordCount(verification.counts) -
+            totalBusinessRecordCount(localCounts)
+          )
+      }, { merge: true });
+
+      cloudMigrationStatus = 'completed';
+      cloudStatusDetails = `Migration complete · ${totalBusinessRecordCount(localCounts)} local business records verified`;
+      cloudReady = true;
+      cloudLastBusinessHash = getBusinessStateHash(localSnapshot);
+
+      // After the controlled first migration, the authenticated user's cloud
+      // state becomes authoritative. LocalStorage remains intact as cache.
+      renderAll();
+      renderAdmin();
+      toast('POS data migrated to Firestore successfully.');
+    } catch (error) {
+      cloudReady = false;
+      setCloudStatus('failed', formatFirestoreError(error));
+
+      try {
+        await setDoc(getCloudMetaRef(uidValue), {
+          status: 'failed',
+          failedAt: Date.now(),
+          error: String(error?.message || error)
+        }, { merge: true });
+      } catch (_) {}
+
+      renderAdmin();
+      toast('Firestore migration failed. Local POS data was preserved.');
+    }
+  }
+
+  async function syncBusinessStateToFirestore() {
+    if (
+      !cloudReady ||
+      !cloudUserUid ||
+      cloudMigrationStatus !== 'completed'
+    ) return;
+
+    const snapshot = extractBusinessState();
+    const hash = getBusinessStateHash(snapshot);
+
+    if (hash === cloudLastBusinessHash) return;
+
+    if (cloudSyncInFlight) {
+      cloudSyncDirty = true;
+      return;
+    }
+
+    cloudSyncInFlight = true;
+    cloudSyncDirty = false;
+
+    try {
+      await writeCloudBusinessState(snapshot, { reconcileDeletes: true });
+      await verifyCloudBusinessState(snapshot, cloudUserUid);
+
+      cloudLastBusinessHash = getBusinessStateHash(snapshot);
+
+      await setDoc(getCloudMetaRef(cloudUserUid), {
+        status: 'completed',
+        lastSyncAt: Date.now(),
+        lastSyncCounts: businessCounts(snapshot)
+      }, { merge: true });
+
+      if (state.adminTab === 'settings' && $('adminList') && $('adminEditor')) {
+        renderSettingsAdmin($('adminList'), $('adminEditor'));
+      }
+    } catch (error) {
+      // Never claim success. Keep localStorage untouched and leave the next
+      // save eligible to retry.
+      setCloudStatus('failed', `Cloud sync failed · local data preserved`);
+      cloudSyncDirty = true;
+      if (state.adminTab === 'settings' && $('adminList') && $('adminEditor')) {
+        renderSettingsAdmin($('adminList'), $('adminEditor'));
+      }
+      console.warn('1911 Firestore sync failed:', error);
+    } finally {
+      cloudSyncInFlight = false;
+
+      if (cloudSyncDirty) {
+        cloudSyncDirty = false;
+        scheduleCloudSync();
+      }
+    }
+  }
+
+  function scheduleCloudSync() {
+    if (cloudSyncTimer) return;
+    cloudSyncTimer = setTimeout(() => {
+      cloudSyncTimer = null;
+      syncBusinessStateToFirestore();
+    }, 700);
+  }
+
+  function forceCloudSync() {
+    if (!cloudReady) {
+      toast('Run the Firestore migration first.');
+      return;
+    }
+    if (cloudSyncTimer) {
+      clearTimeout(cloudSyncTimer);
+      cloudSyncTimer = null;
+    }
+    syncBusinessStateToFirestore()
+      .then(() => toast('Firestore sync complete.'))
+      .catch(() => toast('Firestore sync failed. Local data was preserved.'));
+  }
+
+  async function refreshCloudBusinessFromFirestore() {
+    if (!cloudReady || !cloudUserUid) {
+      toast('Firestore persistence is not active yet.');
+      return;
+    }
+
+    try {
+      const cloud = await readCloudBusinessState(cloudUserUid);
+      applyCloudBusinessState(cloud);
+      saveState();
+      renderAll();
+      renderAdmin();
+      toast('Business data refreshed from Firestore.');
+    } catch (error) {
+      setCloudStatus('failed', 'Cloud read failed · local data preserved');
+      renderAdmin();
+      toast('Firestore read failed. Local data was preserved.');
+    }
+  }
+
+  function getCloudStatusMarkup() {
+    const status = cloudMigrationStatus === 'completed'
+      ? 'READY'
+      : cloudMigrationStatus === 'in-progress'
+        ? 'WORKING'
+        : cloudMigrationStatus === 'failed'
+          ? 'ERROR'
+          : 'NOT STARTED';
+
+    const detail = cloudStatusDetails || 'Cloud persistence has not been migrated yet.';
+    return `
+      <div class="reportCard" style="grid-column:1/-1">
+        <span class="statLabel">Firestore</span>
+        <b>${escapeHtml(status)}</b>
+        <div class="subtle" style="margin-top:6px">${escapeHtml(detail)}</div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:12px">
+          ${isOwner() ? `<button class="mini primary" type="button" onclick="window.__1911.migrateToFirestore()">Migrate to Firestore</button>` : ''}
+          ${cloudReady ? `<button class="mini ghost" type="button" onclick="window.__1911.syncFirestore()">Sync now</button>` : ''}
+          ${cloudReady ? `<button class="mini ghost" type="button" onclick="window.__1911.refreshFromFirestore()">Refresh from Firestore</button>` : ''}
+        </div>
+        <div class="subtle" style="margin-top:8px">Existing localStorage data remains intact. Migration uses stable record IDs and never appends cloud arrays to local arrays.</div>
+      </div>
+    `;
   }
 
   function migrateAndNormalize() {
@@ -1984,115 +2587,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   function normalizeArray(arr, fallback) {
     if (!Array.isArray(arr) || !arr.length) return safeClone(fallback);
     return arr;
-  }
-
-  function repairTable01State() {
-    const normalizeLabel = (value) => String(value || '').trim().toLowerCase();
-    const candidates = state.tables.filter(t =>
-      Number(t?.number) === 1 || normalizeLabel(t?.label) === 'table 01'
-    );
-
-    if (!candidates.length) return {
-      candidateCount: 0,
-      duplicateCount: 0,
-      canonicalId: null,
-      activeOrderId: null,
-      staleReferencesCleared: 0,
-      ordersDeleted: 0
-    };
-
-    const isActiveOrder = (orderId) => {
-      if (!orderId) return null;
-      return state.activeOrders.find(o =>
-        o &&
-        o.id === orderId &&
-        o.status !== 'paid' &&
-        o.paymentStatus !== 'paid'
-      ) || null;
-    };
-
-    // Prefer a Table 01 record that already points at a genuine active order.
-    // Otherwise keep the first real Table 01 record as canonical.
-    let canonical = candidates.find(t => isActiveOrder(t.orderId)) || candidates[0];
-
-    const validActiveRefs = candidates
-      .map(t => isActiveOrder(t.orderId))
-      .filter(Boolean);
-
-    // If every duplicate points at the same active order, keep one canonical
-    // table and preserve that order. A paid/history reference is stale and is
-    // safe to clear from the table object without touching the historical order.
-    const activeIds = [...new Set(validActiveRefs.map(o => o.id))];
-    let unresolvedConflict = activeIds.length > 1;
-
-    if (!isActiveOrder(canonical.orderId) && activeIds.length === 1) {
-      canonical.orderId = activeIds[0];
-    }
-
-    let staleReferencesCleared = 0;
-
-    candidates.forEach(t => {
-      if (t === canonical) return;
-      if (t.orderId && !isActiveOrder(t.orderId)) {
-        t.orderId = null;
-        staleReferencesCleared++;
-      }
-    });
-
-    // Only collapse duplicate Table 01 objects when they do not represent
-    // different legitimate active orders. This avoids destructive migration.
-    if (!unresolvedConflict) {
-      const keep = canonical;
-      const duplicateSet = new Set(candidates.filter(t => t !== keep));
-
-      const latestClosedAt = Math.max(
-        Number(keep.lastClosedAt || 0),
-        ...candidates.map(t => Number(t.lastClosedAt || 0))
-      ) || null;
-      keep.lastClosedAt = latestClosedAt;
-
-      state.tables = state.tables.filter(t => !duplicateSet.has(t));
-
-      // Preserve normal table numbering for all records after the targeted
-      // Table 01 repair. No other table's identity/order reference is changed.
-      state.tables.sort((a, b) => {
-        const an = Number(a.number || 0);
-        const bn = Number(b.number || 0);
-        return an - bn;
-      });
-      state.tables.forEach((t, i) => {
-        t.number = i + 1;
-        if (!t.label) t.label = `Table ${String(i + 1).padStart(2, '0')}`;
-      });
-    }
-
-    // A stale paid order must never remain selected as the current order while
-    // the canonical Table 01 has no active order.
-    const canonicalActive = isActiveOrder(canonical.orderId);
-    if (!canonicalActive) {
-      const current = getOrderById(state.currentOrderId);
-      if (
-        current &&
-        (
-          current.status === 'paid' ||
-          current.paymentStatus === 'paid' ||
-          current.tableId === canonical.id
-        )
-      ) {
-        state.currentOrderId = null;
-      }
-      canonical.orderId = null;
-    }
-
-    return {
-      candidateCount: candidates.length,
-      duplicateCount: Math.max(0, candidates.length - 1),
-      canonicalId: canonical.id || null,
-      activeOrderId: canonical.orderId || null,
-      staleReferencesCleared,
-      ordersDeleted: 0,
-      unresolvedConflict
-    };
   }
 
   function ensureCurrentStaff() {
@@ -2542,15 +3036,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   function getActiveOrderByTableId(tableId) {
     const table = getTableById(tableId);
     if (!table || !table.orderId) return null;
-
-    // A table's orderId is only an active reference when the order actually
-    // exists in activeOrders and is not paid. Never fall back to order history.
-    return state.activeOrders.find(order =>
-      order &&
-      order.id === table.orderId &&
-      order.status !== 'paid' &&
-      order.paymentStatus !== 'paid'
-    ) || null;
+    return getOrderById(table.orderId);
   }
 
   function uidLabel(prefix, value) {
@@ -2783,12 +3269,21 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
     const profile = await loadStaffProfile(user);
 
+    // Authentication remains unchanged. Once the authenticated UID is known,
+    // Phase 3 loads the authoritative cloud business state only when a
+    // completed migration exists; otherwise localStorage remains the source.
+    try {
+      await prepareCloudSession(uid);
+    } catch (cloudError) {
+      cloudReady = false;
+      setCloudStatus('failed', `Cloud read failed · local data preserved`);
+      console.warn('1911 Firestore session load failed:', cloudError);
+    }
+
     sessionProfile = profile;
     processedAuthUid = uid;
     authReady = true;
 
-    // Authentication only establishes identity/access. It never reloads,
-    // merges, appends, or recreates POS business records.
     state.currentStaffId =
       state.staff.find(
         st => st.name === profile.name &&
@@ -4247,26 +4742,15 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   function deleteTable(id) {
     const t = getTableById(id);
     if (!t) return;
-
-    // Do not treat a stale reference to a paid/history order as an active order.
-    const activeOrder = getActiveOrderByTableId(id);
-    if (activeOrder) {
+    if (t.orderId) {
       toast('Close active order before deleting the table.');
       return;
     }
-
-    // Clear only this table's stale reference before deletion. Historical
-    // receipts/orders remain untouched.
-    if (t.orderId) t.orderId = null;
-
     if (!confirm(`Delete ${t.label}?`)) return;
     state.tables = state.tables.filter(x => x.id !== id);
     state.tables.forEach((x, i) => x.number = i + 1);
     state.settings.tableCount = state.tables.length;
     state.adminSelection = null;
-    if (state.currentOrderId && !getOrderById(state.currentOrderId)) {
-      state.currentOrderId = null;
-    }
     saveState();
     renderAll();
     renderAdmin();
@@ -4787,12 +5271,13 @@ function quickSwitchStaff(id) {
       <div class="adminListHead">
         <div>
           <h3 style="margin:0">Settings</h3>
-          <div class="subtle">Brand, payment methods, and display preferences.</div>
+          <div class="subtle">Brand, payment methods, display preferences, and cloud persistence.</div>
         </div>
       </div>
       <div class="reportGrid">
         <div class="reportCard"><span class="statLabel">Brand</span><b>${escapeHtml(state.settings.brandName)}</b></div>
         <div class="reportCard"><span class="statLabel">Tables</span><b>${state.tables.length}</b></div>
+        ${getCloudStatusMarkup()}
       </div>
     `;
     editor.innerHTML = `
@@ -4955,7 +5440,10 @@ function quickSwitchStaff(id) {
     markOrderSent,
     openAdmin,
     openStaffSwitcher,
-    closeCurrentOrder
+    closeCurrentOrder,
+    migrateToFirestore: migrateLocalBusinessToFirestore,
+    syncFirestore: forceCloudSync,
+    refreshFromFirestore: refreshCloudBusinessFromFirestore
   };
 
   // map missing functions to stateful actions
@@ -4990,15 +5478,8 @@ function quickSwitchStaff(id) {
   function openCheckoutModalFallback() {}
 
   // Ensure initial data consistency and show the starting order if present
-  if (state.currentOrderId) {
-    const selected = getOrderById(state.currentOrderId);
-    if (
-      !selected ||
-      selected.status === 'paid' ||
-      selected.paymentStatus === 'paid'
-    ) {
-      state.currentOrderId = null;
-    }
+  if (state.currentOrderId && !getOrderById(state.currentOrderId)) {
+    state.currentOrderId = state.activeOrders[0]?.id || null;
   }
   saveState();
   renderAll();
@@ -5082,10 +5563,7 @@ function quickSwitchStaff(id) {
     state.activeTableFlowId = tableId;
     state.pendingTableId = tableId;
     state.orderEditMode = false;
-    // The selected order must belong to this table's current active session.
-    // A stale currentOrderId must never carry a paid historical order into
-    // the checkout flow.
-    state.currentOrderId = order ? order.id : null;
+    if (order) state.currentOrderId = order.id;
     saveState();
 
     const itemCount = order?.itemCount || 0;
@@ -5110,8 +5588,7 @@ function quickSwitchStaff(id) {
   }
 
   function closeOrderToCheckout() {
-    const tableId = state.modalContext === 'table-flow' ? getFlowTableId() : null;
-    const order = tableId ? getActiveOrderByTableId(tableId) : currentOrder();
+    const order = currentOrder();
     if (!order || !order.items || !order.items.length) {
       closeTableFlowModal();
       return;
