@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+<!DOCTYPE html> 
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -1529,7 +1529,7 @@
       <div class="authActions">
         <button class="pill primary" id="authSubmit" type="submit">Sign In</button>
       </div>
-      <div class="authHint">This login uses Firebase Email/Password authentication. Your POS data stays in localStorage during this phase.</div>
+      <div class="authHint">This login uses Firebase Email/Password authentication. POS business data is synchronized with Firestore, with localStorage retained as a safe offline fallback.</div>
     </form>
   </div>
 </div>
@@ -1693,7 +1693,7 @@
 <script type="module">
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js';
 import { getAuth, setPersistence, browserLocalPersistence, onAuthStateChanged, signInWithEmailAndPassword, signOut } from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js';
-import { getFirestore, doc, getDoc } from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js';
+import { getFirestore, doc, getDoc, getDocs, setDoc, deleteDoc, collection, query, orderBy, limit, writeBatch, runTransaction } from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js';
 
 const firebaseConfig = {
   apiKey: "AIzaSyB_m-lt22FJ7fShyRHDgPEbkYTSOzMpMYM",
@@ -1716,11 +1716,34 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
   const AUTH_UID_PATH = '1911POS/{uid}';
   const AUTH_PROFILE_COLLECTION = '1911POS';
+  const POS_ROOT_COLLECTION = '1911POS';
+  const CLOUD_COLLECTIONS = {
+    categories: 'categories',
+    products: 'products',
+    inventory: 'inventory',
+    tables: 'tables',
+    orders: 'orders',
+    staff: 'staff',
+    settings: 'settings'
+  };
+  const CLOUD_META_COLLECTION = 'meta';
+  const CLOUD_MIGRATION_DOC = 'migration';
 
   let sessionProfile = null;
   let authReady = false;
   let authBusy = false;
   let uiBound = false;
+  let cloudReady = false;
+  let cloudSyncTimer = null;
+  let cloudSyncInFlight = false;
+  let cloudApplying = false;
+  let cloudTenantUid = null;
+  let cloudStatus = 'LOCAL';
+  let cloudLastSyncAt = null;
+  let cloudLastMigrationAt = null;
+  let cloudLastError = '';
+  const cloudShadow = { categories: {}, products: {}, inventory: {}, tables: {}, orders: {}, staff: {}, settings: null };
+  const pendingCloudDeletes = { categories: new Set(), products: new Set(), inventory: new Set(), tables: new Set(), orders: new Set(), staff: new Set(), settings: new Set() };
 
   const defaultState = () => ({
     settings: {
@@ -1868,8 +1891,30 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     return defaultState();
   }
 
-  function saveState() {
-    localStorage.setItem(STORE_KEY, JSON.stringify(state));
+  function saveState(options = {}) {
+    try {
+      localStorage.setItem(STORE_KEY, JSON.stringify(state));
+    } catch (error) {
+      console.error('LOCAL_SAVE_FAILED', error.code || 'localstorage/error', error.message || error);
+      cloudLastError = `Local save failed: ${error.message || error}`;
+    }
+    if (!options.silentCloud && !cloudApplying && authReady && sessionProfile && cloudReady) {
+      scheduleCloudSync();
+    }
+  }
+
+  function scheduleCloudSync(delay = 700) {
+    if (!cloudReady || !authReady || !sessionProfile || cloudApplying) return;
+    clearTimeout(cloudSyncTimer);
+    cloudStatus = 'SYNC_PENDING';
+    cloudSyncTimer = setTimeout(() => {
+      syncStateToCloud().catch(error => {
+        cloudStatus = 'SYNC_FAILED';
+        cloudLastError = formatFirestoreError(error);
+        console.error('CLOUD_SYNC_FAILED', error.code || 'firestore/error', error.message || error);
+        renderHeaderState();
+      });
+    }, delay);
   }
 
   function safeClone(v) {
@@ -2654,16 +2699,32 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     try {
       const profile = await loadStaffProfile(user);
       sessionProfile = profile;
+      setAuthStateView('loading', `Signed in as ${profile.name}. Synchronizing POS data...`, '', true);
+      try {
+        await initializeCloudData(profile);
+      } catch (cloudError) {
+        cloudReady = false;
+        cloudStatus = 'LOCAL';
+        cloudLastError = formatFirestoreError(cloudError);
+        console.error('CLOUD_BOOTSTRAP_FAILED', cloudError.code || 'firestore/error', cloudError.message || cloudError);
+      }
       authReady = true;
-      state.currentStaffId = state.staff.find(st => st.name === profile.name && (st.role || '').toUpperCase() === profile.role)?.id || state.currentStaffId || state.staff[0]?.id || null;
-      saveState();
-      setAuthStateView('ready', `Signed in as ${profile.name}.`, '', false);
+      let matchedStaff = state.staff.find(st => st.uid === profile.uid);
+      if (!matchedStaff) matchedStaff = state.staff.find(st => st.name === profile.name && (st.role || '').toUpperCase() === profile.role);
+      if (matchedStaff) {
+        matchedStaff.uid = profile.uid;
+        matchedStaff.email = profile.email || matchedStaff.email || '';
+      }
+      state.currentStaffId = matchedStaff?.id || state.currentStaffId || state.staff[0]?.id || null;
+      saveState({ silentCloud: true });
+      setAuthStateView('ready', cloudReady ? `Signed in as ${profile.name}. Cloud sync ${cloudStatus.toLowerCase().replace('_',' ')}.` : `Signed in as ${profile.name}. Using local fallback.`, '', false);
       if (!uiBound) {
         bindEvents();
         uiBound = true;
       }
       renderAll();
       scheduleRolloverSafeSave();
+      if (cloudReady) scheduleCloudSync();
     } catch (error) {
       authReady = false;
       sessionProfile = null;
@@ -2703,11 +2764,412 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
   async function handleLogout() {
     try {
+      cloudReady = false;
+      cloudTenantUid = null;
+      cloudStatus = 'LOCAL';
+      clearTimeout(cloudSyncTimer);
       await signOut(auth);
     } catch (error) {
       console.error(error.code || 'auth/error', error.message || error);
       setAuthStateView('locked', 'Logout failed.', friendlyAuthError(error), false);
     }
+  }
+
+
+  function cloudTenantRef(uid = cloudTenantUid || sessionProfile?.uid) {
+    if (!uid) throw new Error('No authenticated POS tenant UID is available.');
+    return doc(db, POS_ROOT_COLLECTION, uid);
+  }
+
+  function cloudCollectionRef(name) {
+    return collection(cloudTenantRef(), CLOUD_COLLECTIONS[name]);
+  }
+
+  function cloudMetaRef() {
+    return doc(cloudTenantRef(), CLOUD_META_COLLECTION, CLOUD_MIGRATION_DOC);
+  }
+
+  function cloudRecordStamp(record) {
+    return Number(record?._updatedAt || record?.updatedAt || 0) || 0;
+  }
+
+  function stripCloudMeta(record) {
+    if (!record || typeof record !== 'object') return record;
+    const copy = safeClone(record);
+    delete copy._updatedAt;
+    delete copy._updatedBy;
+    delete copy._syncedAt;
+    return copy;
+  }
+
+  function cloudPayload(record) {
+    return {
+      ...safeClone(record),
+      _updatedAt: Date.now(),
+      _updatedBy: sessionProfile?.uid || null
+    };
+  }
+
+  function orderCloudRecords() {
+    const map = new Map();
+    [...(state.orders || []), ...(state.activeOrders || [])].forEach(order => {
+      if (!order?.id) return;
+      const existing = map.get(order.id);
+      if (!existing || Number(order.updatedAt || 0) >= Number(existing.updatedAt || 0)) map.set(order.id, order);
+    });
+    return [...map.values()];
+  }
+
+  async function getCloudCollectionRecords(name, recentOnly = false) {
+    const ref = cloudCollectionRef(name);
+    const snap = recentOnly && name === 'orders'
+      ? await getDocs(query(ref, orderBy('_updatedAt', 'desc'), limit(500)))
+      : await getDocs(ref);
+    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  }
+
+  async function readCloudSnapshot() {
+    const results = await Promise.all([
+      getCloudCollectionRecords('categories'),
+      getCloudCollectionRecords('products'),
+      getCloudCollectionRecords('inventory'),
+      getCloudCollectionRecords('tables'),
+      getCloudCollectionRecords('orders', true),
+      getCloudCollectionRecords('staff'),
+      getDocs(cloudCollectionRef('settings'))
+    ]);
+    const [categories, products, inventory, tables, orders, staff, settingsSnap] = results;
+    const settings = settingsSnap.docs.map(d => ({ id: d.id, ...d.data() })).find(v => v.id === 'config') || null;
+    return { categories, products, inventory, tables, orders, staff, settings };
+  }
+
+  function mergeRecord(localRecord, cloudRecord) {
+    if (!localRecord && !cloudRecord) return null;
+    if (!localRecord) return stripCloudMeta(cloudRecord);
+    if (!cloudRecord) return safeClone(localRecord);
+    const localStamp = cloudRecordStamp(localRecord);
+    const cloudStamp = cloudRecordStamp(cloudRecord);
+    if (cloudStamp > localStamp) return stripCloudMeta(cloudRecord);
+    if (localStamp > cloudStamp) return safeClone(localRecord);
+    // When neither side has a trustworthy timestamp, preserve cloud rather than blindly overwriting it.
+    return stripCloudMeta(cloudRecord);
+  }
+
+  function mergeArrayById(localRecords, cloudRecords) {
+    const localMap = new Map((localRecords || []).filter(Boolean).map(r => [String(r.id), r]));
+    const cloudMap = new Map((cloudRecords || []).filter(Boolean).map(r => [String(r.id), r]));
+    const ids = new Set([...localMap.keys(), ...cloudMap.keys()]);
+    const merged = [];
+    ids.forEach(id => {
+      const chosen = mergeRecord(localMap.get(id), cloudMap.get(id));
+      if (chosen) merged.push(chosen);
+    });
+    return merged;
+  }
+
+  function applyCloudSnapshot(snapshot) {
+    cloudApplying = true;
+    try {
+      state.categories = mergeArrayById(state.categories, snapshot.categories);
+      state.products = mergeArrayById(state.products, snapshot.products);
+      state.inventory = mergeArrayById(state.inventory, snapshot.inventory);
+      state.tables = mergeArrayById(state.tables, snapshot.tables);
+      const localOrders = orderCloudRecords();
+      const mergedOrders = mergeArrayById(localOrders, snapshot.orders);
+      state.orders = mergedOrders.filter(o => o && o.status === 'paid');
+      state.activeOrders = mergedOrders.filter(o => o && o.status !== 'paid');
+      state.staff = mergeArrayById(state.staff, snapshot.staff);
+      if (snapshot.settings) {
+        const mergedSettings = mergeRecord(state.settings ? { id: 'config', ...state.settings } : null, snapshot.settings);
+        if (mergedSettings) {
+          delete mergedSettings.id;
+          state.settings = { ...state.settings, ...mergedSettings };
+        }
+      }
+      migrateAndNormalize();
+      ensureCurrentStaff();
+      rebuildCloudShadow(snapshot);
+      saveState({ silentCloud: true });
+    } finally {
+      cloudApplying = false;
+    }
+  }
+
+  function rebuildCloudShadow(snapshot) {
+    Object.keys(cloudShadow).forEach(key => {
+      if (key === 'settings') cloudShadow.settings = snapshot.settings ? stripCloudMeta(snapshot.settings) : null;
+      else {
+        cloudShadow[key] = {};
+        (snapshot[key] || []).forEach(record => {
+          if (record?.id) cloudShadow[key][record.id] = stripCloudMeta(record);
+        });
+      }
+    });
+  }
+
+  function recordsNeedingWrite(name, records) {
+    const shadow = cloudShadow[name] || {};
+    return (records || []).filter(record => {
+      if (!record?.id) return false;
+      const id = String(record.id);
+      const current = stripCloudMeta(record);
+      const previous = shadow[id];
+      return !previous || JSON.stringify(current) !== JSON.stringify(stripCloudMeta(previous));
+    });
+  }
+
+  async function writeRecordsChunked(name, records) {
+    const list = (records || []).filter(Boolean);
+    for (let i = 0; i < list.length; i += 450) {
+      const batch = writeBatch(db);
+      list.slice(i, i + 450).forEach(record => {
+        const id = String(record.id);
+        batch.set(doc(cloudCollectionRef(name), id), cloudPayload(record), { merge: true });
+      });
+      await batch.commit();
+    }
+  }
+
+  async function deletePendingCloudRecords() {
+    for (const [name, ids] of Object.entries(pendingCloudDeletes)) {
+      if (!ids.size) continue;
+      const list = [...ids];
+      for (let i = 0; i < list.length; i += 450) {
+        const batch = writeBatch(db);
+        list.slice(i, i + 450).forEach(id => batch.delete(doc(cloudCollectionRef(name), String(id))));
+        await batch.commit();
+      }
+      ids.clear();
+    }
+  }
+
+  function markCloudDelete(name, id) {
+    if (id) pendingCloudDeletes[name]?.add(String(id));
+  }
+
+  async function syncInventoryRecord(inv) {
+    if (!inv?.id) return;
+    const id = String(inv.id);
+    const previous = cloudShadow.inventory[id];
+    const ref = doc(cloudCollectionRef('inventory'), id);
+    if (previous && JSON.stringify(stripCloudMeta(inv)) === JSON.stringify(stripCloudMeta(previous))) return;
+    if (!previous) {
+      const payload = cloudPayload(inv);
+      await setDoc(ref, payload, { merge: true });
+      cloudShadow.inventory[id] = stripCloudMeta(payload);
+      return;
+    }
+    const localQty = Number(inv.qty || 0);
+    const previousQty = Number(previous.qty || 0);
+    const delta = roundNumber(localQty - previousQty, 6);
+    const metadata = { ...safeClone(inv) };
+    delete metadata.qty;
+    const result = await runTransaction(db, async tx => {
+      const snap = await tx.get(ref);
+      const cloudQty = Number(snap.exists() ? (snap.data()?.qty || 0) : 0);
+      const nextQty = Math.max(0, roundNumber(cloudQty + delta, 6));
+      tx.set(ref, { ...metadata, qty: nextQty, _updatedAt: Date.now(), _updatedBy: sessionProfile?.uid || null }, { merge: true });
+      return nextQty;
+    });
+    inv.qty = result;
+    cloudShadow.inventory[id] = safeClone(inv);
+  }
+
+  async function syncStateToCloud() {
+    if (!cloudReady || !authReady || !sessionProfile || cloudSyncInFlight) return;
+    cloudSyncInFlight = true;
+    cloudStatus = 'SYNC_PENDING';
+    try {
+      const started = Date.now();
+      await setDoc(cloudTenantRef(), {
+        uid: sessionProfile.uid,
+        email: sessionProfile.email || auth.currentUser?.email || '',
+        updatedAt: started,
+        lastSyncedAt: started
+      }, { merge: true });
+      const categoryWrites = recordsNeedingWrite('categories', state.categories);
+      const productWrites = recordsNeedingWrite('products', state.products);
+      const tableWrites = recordsNeedingWrite('tables', state.tables);
+      const orderWrites = recordsNeedingWrite('orders', orderCloudRecords());
+      const staffWrites = recordsNeedingWrite('staff', state.staff);
+      await writeRecordsChunked('categories', categoryWrites);
+      await writeRecordsChunked('products', productWrites);
+      for (const inv of state.inventory) await syncInventoryRecord(inv);
+      await writeRecordsChunked('tables', tableWrites);
+      await writeRecordsChunked('orders', orderWrites);
+      await writeRecordsChunked('staff', staffWrites);
+      const currentSettings = { id: 'config', ...state.settings };
+      if (!cloudShadow.settings || JSON.stringify(stripCloudMeta(currentSettings)) !== JSON.stringify(stripCloudMeta(cloudShadow.settings))) {
+        await setDoc(doc(cloudCollectionRef('settings'), 'config'), cloudPayload(currentSettings), { merge: true });
+      }
+      await deletePendingCloudRecords();
+      cloudLastSyncAt = Date.now();
+      cloudStatus = 'CLOUD_SAVED';
+      cloudLastError = '';
+      rebuildCloudShadow({
+        categories: state.categories,
+        products: state.products,
+        inventory: state.inventory,
+        tables: state.tables,
+        orders: orderCloudRecords(),
+        staff: state.staff,
+        settings: { id: 'config', ...state.settings }
+      });
+    } catch (error) {
+      cloudStatus = 'SYNC_FAILED';
+      cloudLastError = formatFirestoreError(error);
+      throw error;
+    } finally {
+      cloudSyncInFlight = false;
+      renderHeaderState();
+    }
+  }
+
+  async function migrateLocalToCloud(force = false) {
+    if (!sessionProfile) throw new Error('A valid Firebase staff session is required before migration.');
+    cloudStatus = 'SYNC_PENDING';
+    cloudLastError = '';
+    const metaRef = cloudMetaRef();
+    const metaSnap = await getDoc(metaRef);
+    if (metaSnap.exists() && metaSnap.data()?.status === 'complete' && !force) {
+      cloudLastMigrationAt = Number(metaSnap.data()?.completedAt || 0) || null;
+      return { skipped: true, reason: 'already-complete' };
+    }
+
+    const snapshot = await readCloudSnapshot();
+    const merged = {
+      categories: mergeArrayById(state.categories, snapshot.categories),
+      products: mergeArrayById(state.products, snapshot.products),
+      inventory: mergeArrayById(state.inventory, snapshot.inventory),
+      tables: mergeArrayById(state.tables, snapshot.tables),
+      orders: mergeArrayById(orderCloudRecords(), snapshot.orders),
+      staff: mergeArrayById(state.staff, snapshot.staff),
+      settings: mergeRecord(state.settings ? { id: 'config', ...state.settings } : null, snapshot.settings)
+    };
+    cloudApplying = true;
+    try {
+      state.categories = merged.categories;
+      state.products = merged.products;
+      state.inventory = merged.inventory;
+      state.tables = merged.tables;
+      state.orders = merged.orders.filter(o => o.status === 'paid');
+      state.activeOrders = merged.orders.filter(o => o.status !== 'paid');
+      state.staff = merged.staff;
+      if (merged.settings) { delete merged.settings.id; state.settings = { ...state.settings, ...merged.settings }; }
+      migrateAndNormalize();
+      ensureCurrentStaff();
+      saveState({ silentCloud: true });
+    } finally { cloudApplying = false; }
+
+    await writeRecordsChunked('categories', state.categories);
+    await writeRecordsChunked('products', state.products);
+    for (const inv of state.inventory) await setDoc(doc(cloudCollectionRef('inventory'), String(inv.id)), cloudPayload(inv), { merge: true });
+    await writeRecordsChunked('tables', state.tables);
+    await writeRecordsChunked('orders', orderCloudRecords());
+    await writeRecordsChunked('staff', state.staff);
+    await setDoc(doc(cloudCollectionRef('settings'), 'config'), cloudPayload({ ...state.settings, id: 'config' }), { merge: true });
+
+    const completedAt = Date.now();
+    await setDoc(metaRef, {
+      status: 'complete',
+      completedAt,
+      completedBy: sessionProfile.uid,
+      source: 'localStorage',
+      version: '1911CafePOS:v1',
+      collections: {
+        categories: state.categories.length,
+        products: state.products.length,
+        inventory: state.inventory.length,
+        tables: state.tables.length,
+        orders: orderCloudRecords().length,
+        staff: state.staff.length,
+        settings: 1
+      }
+    }, { merge: true });
+    cloudLastMigrationAt = completedAt;
+    cloudLastSyncAt = completedAt;
+    cloudStatus = 'CLOUD_SAVED';
+    cloudReady = true;
+    rebuildCloudShadow({
+      categories: state.categories,
+      products: state.products,
+      inventory: state.inventory,
+      tables: state.tables,
+      orders: orderCloudRecords(),
+      staff: state.staff,
+      settings: { id: 'config', ...state.settings }
+    });
+    return { skipped: false, completedAt };
+  }
+
+  async function initializeCloudData(profile) {
+    cloudTenantUid = profile.uid;
+    cloudReady = false;
+    cloudStatus = 'SYNC_PENDING';
+    const metaSnap = await getDoc(cloudMetaRef());
+    if (!metaSnap.exists() || metaSnap.data()?.status !== 'complete') {
+      await migrateLocalToCloud(false);
+    }
+    const snapshot = await readCloudSnapshot();
+    cloudApplying = true;
+    try {
+      applyCloudSnapshot(snapshot);
+      cloudReady = true;
+      cloudStatus = 'CLOUD_SAVED';
+      cloudLastSyncAt = Date.now();
+      if (metaSnap.exists()) cloudLastMigrationAt = Number(metaSnap.data()?.completedAt || 0) || null;
+    } finally {
+      cloudApplying = false;
+    }
+  }
+
+  async function manualCloudMigration() {
+    if (!authReady || !sessionProfile) return toast('Sign in before migrating POS data.');
+    try {
+      cloudReady = true;
+      const result = await migrateLocalToCloud(true);
+      const snapshot = await readCloudSnapshot();
+      applyCloudSnapshot(snapshot);
+      toast(result.skipped ? 'Cloud migration is already complete.' : 'Local POS data synchronized to Firestore.');
+      renderAll();
+      renderAdmin();
+    } catch (error) {
+      cloudStatus = 'SYNC_FAILED';
+      cloudLastError = formatFirestoreError(error);
+      console.error('MANUAL_MIGRATION_FAILED', error.code || 'firestore/error', error.message || error);
+      toast('Cloud migration failed. Local POS data was preserved.');
+      renderAdmin();
+    }
+  }
+
+  function getCloudStatusText() {
+    if (cloudStatus === 'CLOUD_SAVED') return cloudLastSyncAt ? `Cloud saved · ${formatDateTime(cloudLastSyncAt)}` : 'Cloud saved';
+    if (cloudStatus === 'SYNC_PENDING') return 'Sync pending…';
+    if (cloudStatus === 'SYNC_FAILED') return `Sync failed: ${cloudLastError || 'Unknown error'}`;
+    return cloudLastError ? `Local fallback · ${cloudLastError}` : 'Local fallback active';
+  }
+
+  async function refreshCloudData() {
+    if (!cloudReady || !sessionProfile) return;
+    try {
+      cloudStatus = 'SYNC_PENDING';
+      const snapshot = await readCloudSnapshot();
+      applyCloudSnapshot(snapshot);
+      cloudStatus = 'CLOUD_SAVED';
+      cloudLastSyncAt = Date.now();
+      renderAll();
+      toast('Cloud data refreshed.');
+    } catch (error) {
+      cloudStatus = 'SYNC_FAILED';
+      cloudLastError = formatFirestoreError(error);
+      console.error('CLOUD_REFRESH_FAILED', error.code || 'firestore/error', error.message || error);
+      toast('Cloud refresh failed. Local data remains intact.');
+    }
+  }
+
+  function scheduleCloudDeleteFor(name, id) {
+    markCloudDelete(name, id);
+    scheduleCloudSync(250);
   }
 
   function initializeAuthGate() {
@@ -3452,6 +3914,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     }
     state.activeOrders = state.activeOrders.filter(o => o.id !== order.id);
     state.currentOrderId = state.activeOrders[0]?.id || null;
+    scheduleCloudDeleteFor('orders', order.id);
     saveState();
     renderAll();
     toast('Order closed.');
@@ -3871,6 +4334,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     if (!confirm(`Delete product "${product.name}"?`)) return;
     state.products = state.products.filter(p => p.id !== id);
     // remove references from active and historical orders? keep historical snapshots intact
+    scheduleCloudDeleteFor('products', id);
     saveState();
     renderAll();
     renderAdmin();
@@ -4265,6 +4729,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     if (!confirm(`Delete inventory item "${inv.name}"?`)) return;
     state.inventory = state.inventory.filter(i => i.id !== id);
     state.adminSelection = null;
+    scheduleCloudDeleteFor('inventory', id);
     saveState();
     renderAll();
     renderAdmin();
@@ -4524,6 +4989,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     state.staff = state.staff.filter(s => s.id !== id);
     if (state.currentStaffId === id) state.currentStaffId = state.staff[0].id;
     state.adminSelection = null;
+    scheduleCloudDeleteFor('staff', id);
     ensureCurrentStaff();
     saveState();
     renderAll();
@@ -4679,6 +5145,15 @@ function quickSwitchStaff(id) {
           <label><input type="checkbox" id="set_lowstock" ${state.settings.lowStockAlerts ? 'checked' : ''} /> Low-stock warnings</label>
         </div>
         <button class="mini primary" type="button" onclick="window.__1911.saveSettings()">Save settings</button>
+        <div class="reportCard" style="margin-top:12px">
+          <span class="statLabel">Firestore status</span>
+          <b style="font-size:15px;line-height:1.35">${escapeHtml(getCloudStatusText())}</b>
+          <div class="subtle" style="margin-top:8px">Business data is synchronized under 1911POS/${escapeHtml(sessionProfile?.uid || '—')}. Browser localStorage is retained as the offline fallback.</div>
+          <div class="adminItemActions" style="margin-top:10px">
+            <button class="mini" type="button" onclick="window.__1911.refreshCloudData()">Refresh cloud</button>
+            <button class="mini primary" type="button" onclick="window.__1911.manualCloudMigration()">Migrate / sync local data</button>
+          </div>
+        </div>
       </div>
     `;
   }
@@ -5351,6 +5826,8 @@ function payOrCloseTakeaway() {
   window.__1911.openReportOrders = openReportOrders;
   window.__1911.saveShiftDuty = saveShiftDuty;
   window.__1911.logout = handleLogout;
+  window.__1911.manualCloudMigration = manualCloudMigration;
+  window.__1911.refreshCloudData = refreshCloudData;
   window.__1911.closeModal = uxCloseModal;
   window.__1911.addProduct = uxAddProduct;
   window.__1911.addVariant = uxAddVariant;
