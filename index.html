@@ -1,4 +1,4 @@
-<!DOCTYPE html> 
+<!DOCTYPE html> local demo
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -1742,6 +1742,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   let cloudLastSyncAt = null;
   let cloudLastMigrationAt = null;
   let cloudLastError = '';
+  let cloudAudit = null;
   const cloudShadow = { categories: {}, products: {}, inventory: {}, tables: {}, orders: {}, staff: {}, settings: null };
   const pendingCloudDeletes = { categories: new Set(), products: new Set(), inventory: new Set(), tables: new Set(), orders: new Set(), staff: new Set(), settings: new Set() };
 
@@ -2855,44 +2856,460 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     return stripCloudMeta(cloudRecord);
   }
 
-  function mergeArrayById(localRecords, cloudRecords) {
-    const localMap = new Map((localRecords || []).filter(Boolean).map(r => [String(r.id), r]));
-    const cloudMap = new Map((cloudRecords || []).filter(Boolean).map(r => [String(r.id), r]));
-    const ids = new Set([...localMap.keys(), ...cloudMap.keys()]);
-    const merged = [];
-    ids.forEach(id => {
-      const chosen = mergeRecord(localMap.get(id), cloudMap.get(id));
-      if (chosen) merged.push(chosen);
+  function normalizeIdentityText(value) {
+    return String(value ?? '')
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, ' ');
+  }
+
+  function stableJson(value) {
+    if (Array.isArray(value)) return value.map(stableJson);
+    if (value && typeof value === 'object') {
+      return Object.keys(value).sort().reduce((out, key) => {
+        out[key] = stableJson(value[key]);
+        return out;
+      }, {});
+    }
+    return value;
+  }
+
+  function categoryIdentityKey(record) {
+    return normalizeIdentityText(record?.name);
+  }
+
+  function productIdentityKey(record, categoryLookup = new Map()) {
+    const categoryName = categoryLookup.get(String(record?.categoryId || '')) || normalizeIdentityText(record?.categoryId);
+    const variants = (Array.isArray(record?.variants) ? record.variants : []).map(v => ({
+      name: normalizeIdentityText(v?.name),
+      priceDelta: Number(v?.priceDelta || 0)
+    }));
+    return JSON.stringify([
+      normalizeIdentityText(record?.name),
+      Math.round(Number(record?.price || 0) * 1000) / 1000,
+      categoryName,
+      stableJson(variants)
+    ]);
+  }
+
+  function inventoryIdentityKey(record) {
+    return JSON.stringify([
+      normalizeIdentityText(record?.name),
+      normalizeIdentityText(record?.unit)
+    ]);
+  }
+
+  function tableIdentityKey(record) {
+    return String(Number(record?.number) || normalizeIdentityText(record?.label));
+  }
+
+  function staffIdentityKey(record) {
+    const uidValue = normalizeIdentityText(record?.uid);
+    if (uidValue) return `uid:${uidValue}`;
+    const email = normalizeIdentityText(record?.email);
+    if (email) return `email:${email}`;
+    return '';
+  }
+
+  function entityIdentityKey(name, record, categoryLookup = new Map()) {
+    if (!record?.id) return '';
+    if (name === 'categories') return categoryIdentityKey(record);
+    if (name === 'products') return productIdentityKey(record, categoryLookup);
+    if (name === 'inventory') return inventoryIdentityKey(record);
+    if (name === 'tables') return tableIdentityKey(record);
+    if (name === 'staff') return staffIdentityKey(record);
+    // Orders are transactions. ID is the ONLY safe identity for them.
+    if (name === 'orders') return '';
+    return String(record.id);
+  }
+
+  function mergeRecordWithId(localRecord, cloudRecord, survivorId) {
+    const chosen = mergeRecord(localRecord, cloudRecord) || localRecord || cloudRecord;
+    if (!chosen) return null;
+    const result = safeClone(chosen);
+    result.id = String(survivorId || result.id);
+    return result;
+  }
+
+  function chooseCloudDuplicateSurvivor(records) {
+    return records.slice().sort((a, b) => {
+      const aStamp = cloudRecordStamp(a);
+      const bStamp = cloudRecordStamp(b);
+      if (aStamp !== bStamp) return aStamp - bStamp;
+      return String(a.id || '').localeCompare(String(b.id || ''));
+    })[0];
+  }
+
+  function collapseIdentityDuplicates(name, records, options = {}) {
+    const categoryLookup = options.categoryLookup || new Map();
+    const grouped = new Map();
+    const aliases = {};
+    const deletions = [];
+    const list = (records || []).filter(r => r && r.id).map(safeClone);
+
+    list.forEach(record => {
+      const key = entityIdentityKey(name, record, categoryLookup);
+      if (!key) {
+        const uniqueKey = `__id__${String(record.id)}`;
+        grouped.set(uniqueKey, [record]);
+        return;
+      }
+      if (!grouped.has(key)) grouped.set(key, []);
+      grouped.get(key).push(record);
     });
-    return merged;
+
+    const result = [];
+    grouped.forEach((group, key) => {
+      if (group.length === 1) {
+        result.push(group[0]);
+        return;
+      }
+
+      // Logical duplicates inside the same source are safe to collapse only
+      // when the entity identity function is explicit and deterministic.
+      const survivor = group.slice().sort((a, b) => {
+        const aStamp = cloudRecordStamp(a);
+        const bStamp = cloudRecordStamp(b);
+        if (aStamp !== bStamp) return bStamp - aStamp;
+        return String(a.id).localeCompare(String(b.id));
+      })[0];
+
+      let merged = safeClone(survivor);
+      group.forEach(record => {
+        if (String(record.id) === String(survivor.id)) return;
+        aliases[String(record.id)] = String(survivor.id);
+        if (record._updatedAt || record.updatedAt) {
+          merged = mergeRecord(merged, record) || merged;
+        }
+      });
+      merged.id = String(survivor.id);
+      result.push(merged);
+
+      // Deletion is decided by the caller according to source (cloud/local).
+      if (options.source === 'cloud') {
+        group.forEach(record => {
+          if (String(record.id) !== String(survivor.id)) {
+            deletions.push({
+              collection: name,
+              id: String(record.id),
+              reason: 'duplicate-logical-identity'
+            });
+          }
+        });
+      }
+    });
+
+    return { records: result, aliases, deletions };
+  }
+
+  function reconcileEntityCollection(name, localRecords, cloudRecords, options = {}) {
+    const categoryLookup = options.categoryLookup || new Map();
+    const localCollapsed = collapseIdentityDuplicates(name, localRecords, { categoryLookup, source: 'local' });
+    const cloudCollapsed = collapseIdentityDuplicates(name, cloudRecords, { categoryLookup, source: 'cloud' });
+
+    const local = localCollapsed.records;
+    const cloud = cloudCollapsed.records;
+    const deletions = [...cloudCollapsed.deletions];
+    const aliases = { ...localCollapsed.aliases, ...cloudCollapsed.aliases };
+    const result = [];
+    const usedCloudIds = new Set();
+    const cloudById = new Map(cloud.map(r => [String(r.id), r]));
+
+    // Stable ID is always checked first.
+    local.forEach(localRecord => {
+      const localId = String(localRecord.id);
+      const exactCloud = cloudById.get(localId);
+      if (exactCloud) {
+        result.push(mergeRecordWithId(localRecord, exactCloud, localId));
+        usedCloudIds.add(localId);
+      }
+    });
+
+    // Then reconcile unmatched local records against one logical cloud record.
+    local.forEach(localRecord => {
+      const localId = String(localRecord.id);
+      if (result.some(r => String(r.id) === localId)) return;
+
+      const key = entityIdentityKey(name, localRecord, categoryLookup);
+      if (!key) {
+        result.push(safeClone(localRecord));
+        return;
+      }
+
+      const candidates = cloud.filter(cloudRecord =>
+        !usedCloudIds.has(String(cloudRecord.id)) &&
+        entityIdentityKey(name, cloudRecord, categoryLookup) === key
+      );
+
+      if (!candidates.length) {
+        result.push(safeClone(localRecord));
+        return;
+      }
+
+      // Candidates have already been collapsed inside Firestore, so a match
+      // here is safe to reconcile to the existing local stable ID.
+      const cloudRecord = candidates[0];
+      const cloudId = String(cloudRecord.id);
+      aliases[cloudId] = localId;
+      usedCloudIds.add(cloudId);
+      result.push(mergeRecordWithId(localRecord, cloudRecord, localId));
+      if (cloudId !== localId) {
+        deletions.push({
+          collection: name,
+          id: cloudId,
+          reason: 'stable-id-reconciliation'
+        });
+      }
+    });
+
+    // Keep cloud-only records. They were already internally deduplicated.
+    cloud.forEach(cloudRecord => {
+      const cloudId = String(cloudRecord.id);
+      if (!usedCloudIds.has(cloudId)) result.push(stripCloudMeta(cloudRecord));
+    });
+
+    return {
+      records: result,
+      deletions: deletions.filter((item, index, arr) =>
+        arr.findIndex(x => x.collection === item.collection && x.id === item.id) === index
+      ),
+      aliases
+    };
+  }
+
+  function remapReferences(stateObject, maps) {
+    const categoryAliases = maps.categories || {};
+    const productAliases = maps.products || {};
+    const inventoryAliases = maps.inventory || {};
+    const tableAliases = maps.tables || {};
+    const staffAliases = maps.staff || {};
+
+    stateObject.products = (stateObject.products || []).map(product => ({
+      ...product,
+      categoryId: categoryAliases[String(product.categoryId)] || product.categoryId,
+      recipe: (product.recipe || []).map(recipe => ({
+        ...recipe,
+        inventoryId: inventoryAliases[String(recipe.inventoryId)] || recipe.inventoryId
+      }))
+    }));
+
+    const remapOrder = order => ({
+      ...order,
+      tableId: tableAliases[String(order.tableId)] || order.tableId,
+      staffCreatedId: staffAliases[String(order.staffCreatedId)] || order.staffCreatedId,
+      staffPaidId: staffAliases[String(order.staffPaidId)] || order.staffPaidId,
+      items: (order.items || []).map(item => ({
+        ...item,
+        productId: productAliases[String(item.productId)] || item.productId,
+        categoryId: categoryAliases[String(item.categoryId)] || item.categoryId
+      }))
+    });
+
+    stateObject.orders = (stateObject.orders || []).map(remapOrder);
+    stateObject.activeOrders = (stateObject.activeOrders || []).map(remapOrder);
+    stateObject.tables = (stateObject.tables || []).map(table => ({
+      ...table,
+      orderId: table.orderId || null
+    }));
+    stateObject.currentStaffId = staffAliases[String(stateObject.currentStaffId)] || stateObject.currentStaffId;
+  }
+
+  function reconcileDataSets(localState, snapshot) {
+    const categoryResult = reconcileEntityCollection('categories', localState.categories, snapshot.categories);
+    const categoryAliases = categoryResult.aliases;
+    const remappedLocal = safeClone(localState);
+    remappedLocal.categories = categoryResult.records;
+    remappedLocal.products = (remappedLocal.products || []).map(product => ({
+      ...product,
+      categoryId: categoryAliases[String(product.categoryId)] || product.categoryId
+    }));
+    const remappedCloudProducts = (snapshot.products || []).map(product => ({
+      ...product,
+      categoryId: categoryAliases[String(product.categoryId)] || product.categoryId
+    }));
+
+    const categoryLookup = new Map(categoryResult.records.map(c => [String(c.id), normalizeIdentityText(c.name)]));
+    const productResult = reconcileEntityCollection('products', remappedLocal.products, remappedCloudProducts, { categoryLookup });
+    const productAliases = productResult.aliases;
+
+    remappedLocal.products = productResult.records;
+    remappedLocal.inventory = safeClone(remappedLocal.inventory || []);
+    const inventoryResult = reconcileEntityCollection('inventory', remappedLocal.inventory, snapshot.inventory);
+    const inventoryAliases = inventoryResult.aliases;
+
+    remappedLocal.products = remappedLocal.products.map(product => ({
+      ...product,
+      recipe: (product.recipe || []).map(recipe => ({
+        ...recipe,
+        inventoryId: inventoryAliases[String(recipe.inventoryId)] || recipe.inventoryId
+      }))
+    }));
+
+    const tableResult = reconcileEntityCollection('tables', remappedLocal.tables, snapshot.tables);
+    const tableAliases = tableResult.aliases;
+
+    const staffResult = reconcileEntityCollection('staff', remappedLocal.staff, snapshot.staff);
+    const staffAliases = staffResult.aliases;
+
+    const localOrders = orderCloudRecords();
+    const remappedLocalOrders = localOrders.map(order => ({
+      ...order,
+      tableId: tableAliases[String(order.tableId)] || order.tableId,
+      staffCreatedId: staffAliases[String(order.staffCreatedId)] || order.staffCreatedId,
+      staffPaidId: staffAliases[String(order.staffPaidId)] || order.staffPaidId,
+      items: (order.items || []).map(item => ({
+        ...item,
+        productId: productAliases[String(item.productId)] || item.productId,
+        categoryId: categoryAliases[String(item.categoryId)] || item.categoryId
+      }))
+    }));
+    const remappedCloudOrders = (snapshot.orders || []).map(order => ({
+      ...order,
+      tableId: tableAliases[String(order.tableId)] || order.tableId,
+      staffCreatedId: staffAliases[String(order.staffCreatedId)] || order.staffCreatedId,
+      staffPaidId: staffAliases[String(order.staffPaidId)] || order.staffPaidId,
+      items: (order.items || []).map(item => ({
+        ...item,
+        productId: productAliases[String(item.productId)] || item.productId,
+        categoryId: categoryAliases[String(item.categoryId)] || item.categoryId
+      }))
+    }));
+
+    const orderResult = reconcileEntityCollection('orders', remappedLocalOrders, remappedCloudOrders);
+    const settingsMerged = mergeRecord(localState.settings ? { id: 'config', ...localState.settings } : null, snapshot.settings);
+
+    const combinedDeletions = [
+      ...categoryResult.deletions,
+      ...productResult.deletions,
+      ...inventoryResult.deletions,
+      ...tableResult.deletions,
+      ...staffResult.deletions
+    ];
+
+    const aliases = {
+      categories: categoryAliases,
+      products: productAliases,
+      inventory: inventoryAliases,
+      tables: tableAliases,
+      staff: staffAliases
+    };
+
+    return {
+      state: {
+        ...remappedLocal,
+        categories: categoryResult.records,
+        products: productResult.records,
+        inventory: inventoryResult.records,
+        tables: tableResult.records,
+        orders: orderResult.records.filter(o => o.status === 'paid'),
+        activeOrders: orderResult.records.filter(o => o.status !== 'paid'),
+        staff: staffResult.records,
+        settings: settingsMerged ? (() => {
+          const copy = safeClone(settingsMerged);
+          delete copy.id;
+          return { ...localState.settings, ...copy };
+        })() : safeClone(localState.settings)
+      },
+      cloudRecords: {
+        categories: categoryResult.records,
+        products: productResult.records,
+        inventory: inventoryResult.records,
+        tables: tableResult.records,
+        orders: orderResult.records,
+        staff: staffResult.records,
+        settings: settingsMerged
+      },
+      deletions: combinedDeletions,
+      aliases,
+      ambiguous: [
+        ...[categoryResult, productResult, inventoryResult, tableResult, staffResult]
+          .flatMap(result => result.records || [])
+      ]
+    };
   }
 
   function applyCloudSnapshot(snapshot) {
+    const reconciliation = reconcileDataSets(state, snapshot);
+    cloudAudit = buildCloudAuditReport(reconciliation.cloudRecords, reconciliation.deletions);
     cloudApplying = true;
     try {
-      state.categories = mergeArrayById(state.categories, snapshot.categories);
-      state.products = mergeArrayById(state.products, snapshot.products);
-      state.inventory = mergeArrayById(state.inventory, snapshot.inventory);
-      state.tables = mergeArrayById(state.tables, snapshot.tables);
-      const localOrders = orderCloudRecords();
-      const mergedOrders = mergeArrayById(localOrders, snapshot.orders);
-      state.orders = mergedOrders.filter(o => o && o.status === 'paid');
-      state.activeOrders = mergedOrders.filter(o => o && o.status !== 'paid');
-      state.staff = mergeArrayById(state.staff, snapshot.staff);
-      if (snapshot.settings) {
-        const mergedSettings = mergeRecord(state.settings ? { id: 'config', ...state.settings } : null, snapshot.settings);
-        if (mergedSettings) {
-          delete mergedSettings.id;
-          state.settings = { ...state.settings, ...mergedSettings };
-        }
-      }
+      state.categories = reconciliation.state.categories;
+      state.products = reconciliation.state.products;
+      state.inventory = reconciliation.state.inventory;
+      state.tables = reconciliation.state.tables;
+      state.orders = reconciliation.state.orders;
+      state.activeOrders = reconciliation.state.activeOrders;
+      state.staff = reconciliation.state.staff;
+      state.settings = reconciliation.state.settings;
+      remapReferences(state, reconciliation.aliases);
       migrateAndNormalize();
       ensureCurrentStaff();
-      rebuildCloudShadow(snapshot);
+      rebuildCloudShadow(reconciliation.cloudRecords);
       saveState({ silentCloud: true });
     } finally {
       cloudApplying = false;
     }
+    return reconciliation;
+  }
+
+  function collectionDuplicateAudit(name, records, options = {}) {
+    const list = (records || []).filter(r => r && r.id);
+    const groups = new Map();
+    const categoryLookup = options.categoryLookup || new Map();
+    list.forEach(record => {
+      const key = entityIdentityKey(name, record, categoryLookup);
+      if (!key) return;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(record);
+    });
+    const duplicates = [...groups.entries()]
+      .filter(([, group]) => group.length > 1)
+      .map(([key, group]) => ({
+        key,
+        ids: group.map(r => String(r.id)),
+        labels: group.map(r => r.name || r.label || r.email || r.code || r.id)
+      }));
+    return {
+      physical: list.length,
+      logical: list.length - duplicates.reduce((sum, group) => sum + Math.max(0, group.ids.length - 1), 0),
+      duplicates
+    };
+  }
+
+  function buildCloudAuditReport(cloudRecords, deletions = []) {
+    const categoryLookup = new Map((cloudRecords.categories || []).map(c => [String(c.id), normalizeIdentityText(c.name)]));
+    const collections = {};
+    ['categories', 'products', 'inventory', 'tables', 'orders', 'staff'].forEach(name => {
+      collections[name] = collectionDuplicateAudit(name, cloudRecords[name] || [], { categoryLookup });
+    });
+    collections.settings = { physical: cloudRecords.settings ? 1 : 0, logical: cloudRecords.settings ? 1 : 0, duplicates: [] };
+    return {
+      at: Date.now(),
+      collections,
+      duplicatesDetected: Object.values(collections).reduce((sum, value) => sum + (value.duplicates?.length || 0), 0),
+      deletionsScheduled: deletions.length
+    };
+  }
+
+  async function deleteCloudDuplicates(deletions) {
+    const safeDeletes = (deletions || [])
+      .filter(item => item && item.collection && item.id)
+      .filter(item => ['categories','products','inventory','tables','staff'].includes(item.collection));
+    for (let i = 0; i < safeDeletes.length; i += 450) {
+      const batch = writeBatch(db);
+      safeDeletes.slice(i, i + 450).forEach(item => {
+        batch.delete(doc(cloudCollectionRef(item.collection), String(item.id)));
+      });
+      if (safeDeletes.slice(i, i + 450).length) await batch.commit();
+    }
+  }
+
+  async function auditAndReconcileCloudData() {
+    if (!sessionProfile) throw new Error('A valid Firebase staff session is required before auditing cloud data.');
+    const snapshot = await readCloudSnapshot();
+    const reconciliation = reconcileDataSets(state, snapshot);
+    cloudAudit = buildCloudAuditReport(snapshot, reconciliation.deletions);
+    return { snapshot, reconciliation, audit: cloudAudit };
   }
 
   function rebuildCloudShadow(snapshot) {
@@ -2981,40 +3398,77 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     cloudStatus = 'SYNC_PENDING';
     try {
       const started = Date.now();
+
+      // Reconcile first so a stale browser ID can never recreate an existing
+      // logical business record under a second Firestore document ID.
+      const snapshot = await readCloudSnapshot();
+      const reconciliation = reconcileDataSets(state, snapshot);
+      cloudAudit = buildCloudAuditReport(snapshot, reconciliation.deletions);
+
+      cloudApplying = true;
+      try {
+        state.categories = reconciliation.state.categories;
+        state.products = reconciliation.state.products;
+        state.inventory = reconciliation.state.inventory;
+        state.tables = reconciliation.state.tables;
+        state.orders = reconciliation.state.orders;
+        state.activeOrders = reconciliation.state.activeOrders;
+        state.staff = reconciliation.state.staff;
+        state.settings = reconciliation.state.settings;
+        remapReferences(state, reconciliation.aliases);
+        migrateAndNormalize();
+        ensureCurrentStaff();
+        saveState({ silentCloud: true });
+      } finally {
+        cloudApplying = false;
+      }
+
       await setDoc(cloudTenantRef(), {
         uid: sessionProfile.uid,
         email: sessionProfile.email || auth.currentUser?.email || '',
         updatedAt: started,
         lastSyncedAt: started
       }, { merge: true });
+
       const categoryWrites = recordsNeedingWrite('categories', state.categories);
       const productWrites = recordsNeedingWrite('products', state.products);
       const tableWrites = recordsNeedingWrite('tables', state.tables);
       const orderWrites = recordsNeedingWrite('orders', orderCloudRecords());
       const staffWrites = recordsNeedingWrite('staff', state.staff);
+
       await writeRecordsChunked('categories', categoryWrites);
       await writeRecordsChunked('products', productWrites);
       for (const inv of state.inventory) await syncInventoryRecord(inv);
       await writeRecordsChunked('tables', tableWrites);
       await writeRecordsChunked('orders', orderWrites);
       await writeRecordsChunked('staff', staffWrites);
+
       const currentSettings = { id: 'config', ...state.settings };
       if (!cloudShadow.settings || JSON.stringify(stripCloudMeta(currentSettings)) !== JSON.stringify(stripCloudMeta(cloudShadow.settings))) {
         await setDoc(doc(cloudCollectionRef('settings'), 'config'), cloudPayload(currentSettings), { merge: true });
       }
+
+      await deleteCloudDuplicates(reconciliation.deletions);
       await deletePendingCloudRecords();
+
+      // Verify the post-write state before advertising a successful cloud save.
+      const verifiedSnapshot = await readCloudSnapshot();
+      const verifiedReconciliation = reconcileDataSets(state, verifiedSnapshot);
+      const verificationAudit = buildCloudAuditReport(verifiedSnapshot, verifiedReconciliation.deletions);
+      cloudAudit = verificationAudit;
+
+      if (verificationAudit.duplicatesDetected > 0 || verificationAudit.deletionsScheduled > 0) {
+        // Do not delete again automatically if the verified result is still ambiguous.
+        // Leave the POS usable locally and flag the cloud state.
+        cloudStatus = 'SYNC_FAILED';
+        cloudLastError = 'Cloud verification found unresolved duplicate or ambiguous business records.';
+        throw new Error(cloudLastError);
+      }
+
       cloudLastSyncAt = Date.now();
       cloudStatus = 'CLOUD_SAVED';
       cloudLastError = '';
-      rebuildCloudShadow({
-        categories: state.categories,
-        products: state.products,
-        inventory: state.inventory,
-        tables: state.tables,
-        orders: orderCloudRecords(),
-        staff: state.staff,
-        settings: { id: 'config', ...state.settings }
-      });
+      rebuildCloudShadow(verifiedSnapshot);
     } catch (error) {
       cloudStatus = 'SYNC_FAILED';
       cloudLastError = formatFirestoreError(error);
@@ -3029,53 +3483,78 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     if (!sessionProfile) throw new Error('A valid Firebase staff session is required before migration.');
     cloudStatus = 'SYNC_PENDING';
     cloudLastError = '';
+
     const metaRef = cloudMetaRef();
     const metaSnap = await getDoc(metaRef);
-    if (metaSnap.exists() && metaSnap.data()?.status === 'complete' && !force) {
-      cloudLastMigrationAt = Number(metaSnap.data()?.completedAt || 0) || null;
-      return { skipped: true, reason: 'already-complete' };
+    const previousMeta = metaSnap.exists() ? (metaSnap.data() || {}) : {};
+
+    // Even when a previous migration is marked complete, audit the real
+    // Firestore state first. Older Phase 3 builds could have created
+    // duplicate IDs before completion was recorded.
+    const snapshot = await readCloudSnapshot();
+    const reconciliation = reconcileDataSets(state, snapshot);
+    cloudAudit = buildCloudAuditReport(snapshot, reconciliation.deletions);
+
+    if (!force && previousMeta.status === 'complete' && reconciliation.deletions.length === 0) {
+      cloudLastMigrationAt = Number(previousMeta.completedAt || 0) || null;
+      return { skipped: true, reason: 'already-complete', audit: cloudAudit };
     }
 
-    const snapshot = await readCloudSnapshot();
-    const merged = {
-      categories: mergeArrayById(state.categories, snapshot.categories),
-      products: mergeArrayById(state.products, snapshot.products),
-      inventory: mergeArrayById(state.inventory, snapshot.inventory),
-      tables: mergeArrayById(state.tables, snapshot.tables),
-      orders: mergeArrayById(orderCloudRecords(), snapshot.orders),
-      staff: mergeArrayById(state.staff, snapshot.staff),
-      settings: mergeRecord(state.settings ? { id: 'config', ...state.settings } : null, snapshot.settings)
-    };
     cloudApplying = true;
     try {
-      state.categories = merged.categories;
-      state.products = merged.products;
-      state.inventory = merged.inventory;
-      state.tables = merged.tables;
-      state.orders = merged.orders.filter(o => o.status === 'paid');
-      state.activeOrders = merged.orders.filter(o => o.status !== 'paid');
-      state.staff = merged.staff;
-      if (merged.settings) { delete merged.settings.id; state.settings = { ...state.settings, ...merged.settings }; }
+      state.categories = reconciliation.state.categories;
+      state.products = reconciliation.state.products;
+      state.inventory = reconciliation.state.inventory;
+      state.tables = reconciliation.state.tables;
+      state.orders = reconciliation.state.orders;
+      state.activeOrders = reconciliation.state.activeOrders;
+      state.staff = reconciliation.state.staff;
+      state.settings = reconciliation.state.settings;
+      remapReferences(state, reconciliation.aliases);
       migrateAndNormalize();
       ensureCurrentStaff();
       saveState({ silentCloud: true });
-    } finally { cloudApplying = false; }
+    } finally {
+      cloudApplying = false;
+    }
 
     await writeRecordsChunked('categories', state.categories);
     await writeRecordsChunked('products', state.products);
-    for (const inv of state.inventory) await setDoc(doc(cloudCollectionRef('inventory'), String(inv.id)), cloudPayload(inv), { merge: true });
+    for (const inv of state.inventory) await syncInventoryRecord(inv);
     await writeRecordsChunked('tables', state.tables);
     await writeRecordsChunked('orders', orderCloudRecords());
     await writeRecordsChunked('staff', state.staff);
     await setDoc(doc(cloudCollectionRef('settings'), 'config'), cloudPayload({ ...state.settings, id: 'config' }), { merge: true });
 
+    // Delete only duplicates whose identity was established by the
+    // reconciliation algorithm. Historical orders are never auto-deduped.
+    await deleteCloudDuplicates(reconciliation.deletions);
+
+    const verifiedSnapshot = await readCloudSnapshot();
+    const verifiedReconciliation = reconcileDataSets(state, verifiedSnapshot);
     const completedAt = Date.now();
+    cloudAudit = buildCloudAuditReport(verifiedSnapshot, verifiedReconciliation.deletions);
+
+    if (cloudAudit.duplicatesDetected > 0 || cloudAudit.deletionsScheduled > 0) {
+      cloudStatus = 'SYNC_FAILED';
+      cloudLastError = 'Migration verification found unresolved duplicate or ambiguous business records.';
+      await setDoc(metaRef, {
+        status: 'partial',
+        updatedAt: completedAt,
+        updatedBy: sessionProfile.uid,
+        version: '1911CafePOS:v1',
+        audit: cloudAudit
+      }, { merge: true });
+      throw new Error(cloudLastError);
+    }
+
     await setDoc(metaRef, {
       status: 'complete',
       completedAt,
       completedBy: sessionProfile.uid,
-      source: 'localStorage',
+      source: 'localStorage+firestore-reconciled',
       version: '1911CafePOS:v1',
+      audit: cloudAudit,
       collections: {
         categories: state.categories.length,
         products: state.products.length,
@@ -3086,40 +3565,33 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
         settings: 1
       }
     }, { merge: true });
+
     cloudLastMigrationAt = completedAt;
     cloudLastSyncAt = completedAt;
     cloudStatus = 'CLOUD_SAVED';
     cloudReady = true;
-    rebuildCloudShadow({
-      categories: state.categories,
-      products: state.products,
-      inventory: state.inventory,
-      tables: state.tables,
-      orders: orderCloudRecords(),
-      staff: state.staff,
-      settings: { id: 'config', ...state.settings }
-    });
-    return { skipped: false, completedAt };
+    rebuildCloudShadow(verifiedSnapshot);
+    return { skipped: false, completedAt, audit: cloudAudit };
   }
 
   async function initializeCloudData(profile) {
     cloudTenantUid = profile.uid;
     cloudReady = false;
     cloudStatus = 'SYNC_PENDING';
-    const metaSnap = await getDoc(cloudMetaRef());
-    if (!metaSnap.exists() || metaSnap.data()?.status !== 'complete') {
-      await migrateLocalToCloud(false);
-    }
+
+    // Always audit/reconcile on login so a previous migration marker cannot
+    // mask duplicate physical records.
+    await migrateLocalToCloud(false);
     const snapshot = await readCloudSnapshot();
-    cloudApplying = true;
-    try {
-      applyCloudSnapshot(snapshot);
-      cloudReady = true;
-      cloudStatus = 'CLOUD_SAVED';
-      cloudLastSyncAt = Date.now();
-      if (metaSnap.exists()) cloudLastMigrationAt = Number(metaSnap.data()?.completedAt || 0) || null;
-    } finally {
-      cloudApplying = false;
+    const reconciliation = applyCloudSnapshot(snapshot);
+    cloudAudit = buildCloudAuditReport(snapshot, reconciliation.deletions);
+
+    cloudReady = true;
+    cloudStatus = 'CLOUD_SAVED';
+    cloudLastSyncAt = Date.now();
+    const metaSnap = await getDoc(cloudMetaRef());
+    if (metaSnap.exists()) {
+      cloudLastMigrationAt = Number(metaSnap.data()?.completedAt || 0) || null;
     }
   }
 
@@ -3130,7 +3602,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       const result = await migrateLocalToCloud(true);
       const snapshot = await readCloudSnapshot();
       applyCloudSnapshot(snapshot);
-      toast(result.skipped ? 'Cloud migration is already complete.' : 'Local POS data synchronized to Firestore.');
+      toast(result.skipped ? 'Cloud migration is already complete.' : 'Local POS data synchronized to Firestore with duplicate reconciliation.');
       renderAll();
       renderAdmin();
     } catch (error) {
@@ -3149,12 +3621,33 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     return cloudLastError ? `Local fallback · ${cloudLastError}` : 'Local fallback active';
   }
 
+  async function auditCloudData() {
+    if (!authReady || !sessionProfile) return toast('Sign in before auditing cloud data.');
+    try {
+      const result = await auditAndReconcileCloudData();
+      const duplicateCount = result.audit.duplicatesDetected;
+      if (duplicateCount > 0 || result.reconciliation.deletions.length > 0) {
+        toast(`Cloud audit found ${duplicateCount} duplicate group${duplicateCount === 1 ? '' : 's'}. Reconciliation is available through migration.`);
+      } else {
+        toast('Cloud audit found no logical duplicates.');
+      }
+      renderAdmin();
+    } catch (error) {
+      cloudStatus = 'SYNC_FAILED';
+      cloudLastError = formatFirestoreError(error);
+      console.error('CLOUD_AUDIT_FAILED', error.code || 'firestore/error', error.message || error);
+      toast('Cloud audit failed. Local data remains intact.');
+      renderAdmin();
+    }
+  }
+
   async function refreshCloudData() {
     if (!cloudReady || !sessionProfile) return;
     try {
       cloudStatus = 'SYNC_PENDING';
       const snapshot = await readCloudSnapshot();
-      applyCloudSnapshot(snapshot);
+      const reconciliation = applyCloudSnapshot(snapshot);
+      cloudAudit = buildCloudAuditReport(snapshot, reconciliation.deletions);
       cloudStatus = 'CLOUD_SAVED';
       cloudLastSyncAt = Date.now();
       renderAll();
@@ -5151,8 +5644,16 @@ function quickSwitchStaff(id) {
           <div class="subtle" style="margin-top:8px">Business data is synchronized under 1911POS/${escapeHtml(sessionProfile?.uid || '—')}. Browser localStorage is retained as the offline fallback.</div>
           <div class="adminItemActions" style="margin-top:10px">
             <button class="mini" type="button" onclick="window.__1911.refreshCloudData()">Refresh cloud</button>
+            <button class="mini" type="button" onclick="window.__1911.auditCloudData()">Audit duplicates</button>
             <button class="mini primary" type="button" onclick="window.__1911.manualCloudMigration()">Migrate / sync local data</button>
           </div>
+          ${cloudAudit ? `
+          <div class="subtle" style="margin-top:10px">
+            Last cloud audit: ${escapeHtml(formatDateTime(cloudAudit.at))} ·
+            ${Number(cloudAudit.duplicatesDetected || 0)} duplicate group${Number(cloudAudit.duplicatesDetected || 0) === 1 ? '' : 's'} detected ·
+            ${Number(cloudAudit.deletionsScheduled || 0)} safe deletion${Number(cloudAudit.deletionsScheduled || 0) === 1 ? '' : 's'} scheduled
+          </div>
+          ` : ''}
         </div>
       </div>
     `;
@@ -5828,6 +6329,7 @@ function payOrCloseTakeaway() {
   window.__1911.logout = handleLogout;
   window.__1911.manualCloudMigration = manualCloudMigration;
   window.__1911.refreshCloudData = refreshCloudData;
+  window.__1911.auditCloudData = auditCloudData;
   window.__1911.closeModal = uxCloseModal;
   window.__1911.addProduct = uxAddProduct;
   window.__1911.addVariant = uxAddVariant;
