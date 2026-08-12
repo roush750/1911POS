@@ -1787,9 +1787,9 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       <div>Status: <b data-cloud-debug="status">Starting…</b></div>
       <pre data-cloud-debug="details" style="white-space:pre-wrap;margin:8px 0;color:#ddd"></pre>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
-        <button data-cloud-debug="sync">Force sync now</button>
-        <button data-cloud-debug="read">Read Firebase</button>
-        <button data-cloud-debug="test">Test Firebase write</button>
+        <button type="button" data-cloud-debug="sync">Force sync now</button>
+        <button type="button" data-cloud-debug="read">Read Firebase</button>
+        <button type="button" data-cloud-debug="test">Test Firebase write</button>
       </div>`;
     document.body.appendChild(panel);
     panel.querySelector('[data-cloud-debug="close"]').onclick = () => panel.remove();
@@ -1821,20 +1821,38 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
         setCloudDiagnostic({ status: 'Firebase read FAILED', lastAction: 'Manual Firebase read', lastError: formatFirestoreError(e) });
       }
     };
-    panel.querySelector('[data-cloud-debug="test"]').onclick = async () => {
+    panel.querySelector('[data-cloud-debug="test"]').addEventListener('click', async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      setCloudDiagnostic({ status: 'TEST CLICKED — contacting Firebase…', lastAction: 'Manual Firebase test write', lastError: '' });
       try {
-        const uid = sessionProfile?.uid;
+        const uid = sessionProfile?.uid || auth.currentUser?.uid;
         if (!uid) throw new Error('No authenticated Firebase UID.');
+        setCloudDiagnostic({ status: 'Writing one diagnostic document…', lastAction: `Manual Firebase test write (${uid})` });
         const ref = doc(db, '1911POS', uid, '_diagnostics', 'connection');
-        await setDoc(ref, { ok: true, uid, testedAt: Date.now() });
+        const payload = { ok: true, uid: String(uid), testedAt: Date.now(), source: '1911POS Phase 3 diagnostic' };
+        await setDoc(ref, payload, { merge: true });
+        setCloudDiagnostic({ status: 'Write succeeded — reading it back…' });
         const snap = await getDoc(ref);
         if (!snap.exists()) throw new Error('Firebase write returned but the test document could not be read back.');
-        setCloudDiagnostic({ status: 'Firebase READ + WRITE successful', lastAction: 'Manual Firebase test write', lastReadAt: Date.now(), lastSyncAt: Date.now(), lastError: '' });
+        setCloudDiagnostic({
+          status: 'Firebase READ + WRITE successful',
+          lastAction: 'Manual Firebase test write',
+          lastReadAt: Date.now(),
+          lastSyncAt: Date.now(),
+          writes: Number(cloudDiagnostics.writes || 0) + 1,
+          lastError: ''
+        });
         toast('Firebase read/write test passed.');
       } catch (e) {
-        setCloudDiagnostic({ status: 'Firebase WRITE/READ TEST FAILED', lastAction: 'Manual Firebase test write', lastError: formatFirestoreError(e) });
+        console.error('1911 Firebase diagnostic test failed:', e);
+        setCloudDiagnostic({ status: 'FIREBASE TEST FAILED', lastAction: 'Manual Firebase test write', lastError: formatFirestoreError(e) });
         toast('Firebase test failed — check diagnostic panel.');
       }
+    }, { passive: false });
+    window.test1911FirebaseWrite = async () => {
+      const button = panel.querySelector('[data-cloud-debug="test"]');
+      button?.click();
     };
     setCloudDiagnostic();
   }
