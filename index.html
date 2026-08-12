@@ -1707,7 +1707,7 @@ const firebaseConfig = {
 
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
-const db = initializeFirestore(app, { experimentalForceLongPolling: true, useFetchStreams: false });
+const db = initializeFirestore(app, { experimentalAutoDetectLongPolling: true, ignoreUndefinedProperties: true });
 setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Firebase persistence setup failed:', err));
 
 (() => {
@@ -1826,8 +1826,8 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       event.preventDefault();
       event.stopPropagation();
       setCloudDiagnostic({
-        status: '1/3 — Testing optimized REST write…',
-        lastAction: 'Canonical REST diagnostic write',
+        status: '1/3 — Testing optimized SDK write…',
+        lastAction: 'Canonical SDK diagnostic write',
         lastError: ''
       });
       try {
@@ -1835,27 +1835,24 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
         if (!uid) throw new Error('No authenticated Firebase UID.');
 
         const started = Date.now();
-        const diagnosticName = `projects/${firebaseConfig.projectId}/databases/(default)/documents/1911POS/${encodeURIComponent(String(uid))}/_diagnostics/optimizedWrite`;
-        const fields = firestoreRestFields({
+        await setDoc(doc(db, '1911POS', String(uid), '_diagnostics', 'optimizedWrite'), {
           ok: true,
           uid: String(uid),
           testedAt: Date.now(),
-          source: '1911POS Phase 3 optimized REST diagnostic'
-        });
-
-        await writeRestDocument(String(uid), diagnosticName, fields, { timeoutMs: 15000 });
+          source: '1911POS Phase 3 optimized SDK diagnostic'
+        }, { merge: false });
 
         setCloudDiagnostic({
-          status: '2/3 — REST write succeeded. Reading it back…',
-          lastAction: 'Canonical REST diagnostic write'
+          status: '2/3 — SDK write succeeded. Reading it back…',
+          lastAction: 'Canonical SDK diagnostic write'
         });
 
         const snap = await getDoc(doc(db, '1911POS', String(uid), '_diagnostics', 'optimizedWrite'));
-        if (!snap.exists()) throw new Error('REST write returned successfully but the diagnostic document could not be read back.');
+        if (!snap.exists()) throw new Error('SDK write returned successfully but the diagnostic document could not be read back.');
 
         setCloudDiagnostic({
           status: '3/3 — OPTIMIZED FIREBASE WRITE PASSED',
-          lastAction: 'REST write + SDK read-back',
+          lastAction: 'SDK write + SDK read-back',
           lastReadAt: Date.now(),
           lastSyncAt: Date.now(),
           writes: Number(cloudDiagnostics.writes || 0) + 1,
@@ -1867,7 +1864,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
         console.error('1911 optimized Firebase diagnostic failed:', e);
         setCloudDiagnostic({
           status: 'FIREBASE WRITE TEST FAILED',
-          lastAction: 'Canonical REST diagnostic write',
+          lastAction: 'Canonical SDK diagnostic write',
           lastError: formatFirestoreError(e)
         });
         toast('Firebase write test failed — check diagnostic panel.');
@@ -2256,78 +2253,35 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     return readLegacyCloudBusinessState(uid);
   }
 
-  async function writeRestDocument(uid, documentName, fields, options = {}) {
-    const user = auth.currentUser;
-    if (!user || user.uid !== String(uid)) {
-      const e = new Error('No authenticated Firebase user for Firestore REST write.');
-      e.code = 'firestore/rest-auth';
-      throw e;
-    }
-
-    const idToken = await user.getIdToken(false);
-    const endpoint = `https://firestore.googleapis.com/v1/${documentName}`;
-    const controller = new AbortController();
-    const timeoutMs = Number(options.timeoutMs || 15000);
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-    try {
-      const response = await fetch(endpoint, {
-        method: options.method || 'PATCH',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${idToken}`
-        },
-        body: JSON.stringify({ fields }),
-        cache: 'no-store',
-        signal: controller.signal
-      });
-      const text = await response.text();
-      let payload = null;
-      try { payload = text ? JSON.parse(text) : null; } catch (_) {}
-
-      if (!response.ok) {
-        const message = payload?.error?.message || text || `HTTP ${response.status}`;
-        const e = new Error(`Firestore REST write failed: ${message}`);
-        e.code = `firestore/rest-${response.status}`;
-        e.httpStatus = response.status;
-        throw e;
-      }
-      return payload;
-    } catch (error) {
-      if (error?.name === 'AbortError') {
-        const e = new Error(`Firestore REST write timed out after ${timeoutMs / 1000} seconds.`);
-        e.code = 'firestore/rest-timeout';
-        throw e;
-      }
-      throw error;
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
   async function writeCanonicalStateOnce(uid, business) {
     const payload = {
       version: 1,
       savedAt: Date.now(),
       businessState: business
     };
-    const fields = firestoreRestFields(payload);
-    // Firestore document limit is 1 MiB. Convert to JSON so the browser can
-    // report a useful error before attempting an oversized write.
-    const estimatedBytes = new Blob([JSON.stringify(fields)]).size;
+
+    // Firestore documents have a 1 MiB limit. Keep a safety margin so a
+    // near-limit payload never reaches the network.
+    const estimatedBytes = new Blob([JSON.stringify(payload)]).size;
     if (estimatedBytes > 950000) {
       const e = new Error(`Canonical POS state is too large for one Firestore document (${Math.round(estimatedBytes / 1024)} KiB).`);
       e.code = 'firestore/canonical-state-too-large';
       throw e;
     }
-    return writeRestDocument(uid, canonicalStateRestName(uid), fields, { timeoutMs: 20000 });
+
+    // Use the Firebase Web SDK directly. The previous REST path returned
+    // HTTP 429 even though the Firebase console could write successfully.
+    // The SDK also provides the browser's normal Firestore network/offline
+    // queue instead of forcing a separate REST transport.
+    await setDoc(canonicalStateRef(uid), payload, { merge: false });
+    return true;
   }
 
   async function writeCanonicalStateWithRetry(uid, business) {
     let lastError = null;
-    // Keep retries deliberately sparse: Firestore RESOURCE_EXHAUSTED is often
-    // transient, but repeated immediate writes only make it worse.
-    const delays = [0, 3000, 8000, 15000];
+    // Do not hammer Firestore. A single failed attempt followed by a sparse
+    // retry is enough; normal POS changes are coalesced by scheduleCloudPersistence.
+    const delays = [0, 5000];
     for (let attempt = 0; attempt < delays.length; attempt++) {
       if (delays[attempt]) await new Promise(resolve => setTimeout(resolve, delays[attempt]));
       try {
@@ -2335,18 +2289,14 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       } catch (error) {
         lastError = error;
         const retryableCodes = new Set([
-          'firestore/rest-429',
-          'firestore/rest-500',
-          'firestore/rest-502',
-          'firestore/rest-503',
-          'firestore/rest-504',
-          'firestore/rest-timeout'
+          'unavailable', 'deadline-exceeded', 'aborted', 'resource-exhausted',
+          'firestore/rest-429', 'firestore/rest-timeout'
         ]);
-        const retryable = retryableCodes.has(String(error?.code || ''));
+        const retryable = retryableCodes.has(String(error?.code || '').toLowerCase());
         if (!retryable || attempt === delays.length - 1) throw error;
       }
     }
-    throw lastError || new Error('Firestore REST write failed.');
+    throw lastError || new Error('Firestore write failed.');
   }
 
   async function writeCloudBusinessState(uid, source = 'localStorage', force = false) {
@@ -2402,7 +2352,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       deletes: 0,
       source,
       mode: source,
-      extra: 'Canonical cloud document: 1911POS/{uid}/state/main · REST PATCH · writes only when business state changes',
+      extra: 'Canonical cloud document: 1911POS/{uid}/state/main · Firebase Web SDK setDoc · writes only when business state changes',
       lastError: ''
     });
 
