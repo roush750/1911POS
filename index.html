@@ -1693,7 +1693,7 @@
 <script type="module">
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js';
 import { getAuth, setPersistence, browserLocalPersistence, onAuthStateChanged, signInWithEmailAndPassword, signOut } from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js';
-import { getFirestore, doc, getDoc } from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js';
+import { getFirestore, doc, getDoc, collection, getDocs, setDoc, writeBatch } from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js';
 
 const firebaseConfig = {
   apiKey: "AIzaSyB_m-lt22FJ7fShyRHDgPEbkYTSOzMpMYM",
@@ -1858,6 +1858,337 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   bindEvents();
   prepareAuthScreen();
 
+  // Phase 3: Firestore is the cross-device source of business data.
+  // localStorage remains intact as the Phase 2 local cache/fallback.
+  const CLOUD_COLLECTIONS = ['categories', 'inventory', 'orders', 'products', 'staff', 'tables'];
+  const CLOUD_ROOT_COLLECTION = '1911POS';
+  const CLOUD_SETTINGS_COLLECTION = 'settings';
+  const CLOUD_SETTINGS_DOC = 'main';
+  let cloudUserUid = null;
+  let cloudReady = false;
+  let cloudSyncTimer = null;
+  let cloudSyncInFlight = false;
+  let cloudSyncQueued = false;
+  let cloudKnownIds = Object.fromEntries(CLOUD_COLLECTIONS.map(name => [name, new Set()]));
+
+  function hasLocalPhase2Data() {
+    try {
+      return !!localStorage.getItem(STORE_KEY);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function cloudCollectionRef(uidValue, name) {
+    return collection(db, CLOUD_ROOT_COLLECTION, uidValue, name);
+  }
+
+  function cloudDocRef(uidValue, name, id) {
+    return doc(db, CLOUD_ROOT_COLLECTION, uidValue, name, String(id));
+  }
+
+  function cloudSettingsRef(uidValue) {
+    return doc(db, CLOUD_ROOT_COLLECTION, uidValue, CLOUD_SETTINGS_COLLECTION, CLOUD_SETTINGS_DOC);
+  }
+
+  function extractCloudState() {
+    const business = {
+      settings: safeClone(state.settings || {}),
+      categories: safeClone(Array.isArray(state.categories) ? state.categories : []),
+      inventory: safeClone(Array.isArray(state.inventory) ? state.inventory : []),
+      products: safeClone(Array.isArray(state.products) ? state.products : []),
+      tables: safeClone(Array.isArray(state.tables) ? state.tables : []),
+      staff: safeClone(Array.isArray(state.staff) ? state.staff : []),
+      orders: safeClone([
+        ...(Array.isArray(state.orders) ? state.orders : []),
+        ...(Array.isArray(state.activeOrders) ? state.activeOrders : [])
+      ])
+    };
+
+    const dedupeById = (records) => {
+      const map = new Map();
+      records.forEach(record => {
+        if (!record || !record.id) return;
+        map.set(String(record.id), record);
+      });
+      return [...map.values()];
+    };
+
+    business.orders = dedupeById(business.orders);
+    business.categories = dedupeById(business.categories);
+    business.inventory = dedupeById(business.inventory);
+    business.products = dedupeById(business.products);
+    business.tables = dedupeById(business.tables);
+    business.staff = dedupeById(business.staff);
+
+    // Every localStorage field is retained. Core business collections above
+    // carry records; settings/main carries the remaining POS state needed to
+    // restore operational/UI state without changing the existing UI.
+    const coreKeys = new Set(['settings', 'categories', 'inventory', 'products', 'tables', 'orders', 'activeOrders', 'staff']);
+    const uiState = {};
+    Object.keys(state).forEach(key => {
+      if (!coreKeys.has(key)) uiState[key] = safeClone(state[key]);
+    });
+    business.uiState = uiState;
+    return business;
+  }
+
+  function cloudRecordCount(snapshot) {
+    if (!snapshot) return 0;
+    return CLOUD_COLLECTIONS.reduce((sum, name) => {
+      const list = Array.isArray(snapshot[name]) ? snapshot[name] : [];
+      return sum + list.length;
+    }, 0) + (snapshot.settings ? 1 : 0);
+  }
+
+  function cloudHasBusinessData(snapshot) {
+    if (!snapshot) return false;
+    if (cloudRecordCount(snapshot) > 0) return true;
+    return !!snapshot.settingsData?.settings || !!snapshot.settingsData?.uiState;
+  }
+
+  function resetCloudKnownIds() {
+    CLOUD_COLLECTIONS.forEach(name => {
+      cloudKnownIds[name] = new Set();
+    });
+  }
+
+  async function readCloudBusinessState(uidValue) {
+    if (!db) throw new Error('Firestore is not initialized.');
+    resetCloudKnownIds();
+
+    const results = await Promise.all(
+      CLOUD_COLLECTIONS.map(async name => {
+        const snap = await getDocs(cloudCollectionRef(uidValue, name));
+        const records = snap.docs.map(d => {
+          cloudKnownIds[name].add(d.id);
+          return { id: d.id, ...(d.data() || {}) };
+        });
+        return [name, records];
+      })
+    );
+
+    const settingsSnap = await getDoc(cloudSettingsRef(uidValue));
+    const settingsData = settingsSnap.exists() ? (settingsSnap.data() || {}) : null;
+
+    return {
+      categories: Object.fromEntries(results)[ 'categories' ] || [],
+      inventory: Object.fromEntries(results)[ 'inventory' ] || [],
+      orders: Object.fromEntries(results)[ 'orders' ] || [],
+      products: Object.fromEntries(results)[ 'products' ] || [],
+      staff: Object.fromEntries(results)[ 'staff' ] || [],
+      tables: Object.fromEntries(results)[ 'tables' ] || [],
+      settingsData,
+      settings: settingsData?.settings || null,
+      uiState: settingsData?.uiState || null
+    };
+  }
+
+  async function writeMissingCloudRecords(uidValue, localSnapshot, cloudSnapshot) {
+    const writes = [];
+    const cloudIds = name => new Set((cloudSnapshot?.[name] || []).map(record => String(record.id)));
+
+    for (const name of CLOUD_COLLECTIONS) {
+      const existing = cloudIds(name);
+      for (const record of localSnapshot[name] || []) {
+        if (!record?.id || existing.has(String(record.id))) continue;
+        writes.push({
+          type: 'set',
+          ref: cloudDocRef(uidValue, name, record.id),
+          data: safeClone(record)
+        });
+      }
+    }
+
+    if (localSnapshot?.settings && (!cloudSnapshot?.settingsData?.settings || !cloudSnapshot?.settingsData?.uiState)) {
+      writes.push({
+        type: 'set',
+        ref: cloudSettingsRef(uidValue),
+        data: {
+          schemaVersion: 1,
+          settings: safeClone(cloudSnapshot?.settingsData?.settings || localSnapshot.settings),
+          uiState: safeClone(cloudSnapshot?.settingsData?.uiState || localSnapshot.uiState || {})
+        }
+      });
+    }
+
+    for (let i = 0; i < writes.length; i += 450) {
+      const batch = writeBatch(db);
+      writes.slice(i, i + 450).forEach(write => batch.set(write.ref, write.data, { merge: true }));
+      await batch.commit();
+    }
+
+    console.info(`[1911 Firestore] migration created ${writes.length} missing cloud documents`);
+    return writes.length;
+  }
+
+  function applyCloudState(snapshot) {
+    const settingsData = snapshot?.settingsData || {};
+    if (snapshot?.settings) state.settings = safeClone(snapshot.settings);
+    if (Array.isArray(snapshot?.categories)) state.categories = safeClone(snapshot.categories);
+    if (Array.isArray(snapshot?.inventory)) state.inventory = safeClone(snapshot.inventory);
+    if (Array.isArray(snapshot?.products)) state.products = safeClone(snapshot.products);
+    if (Array.isArray(snapshot?.tables)) state.tables = safeClone(snapshot.tables);
+    if (Array.isArray(snapshot?.staff)) state.staff = safeClone(snapshot.staff);
+    if (Array.isArray(snapshot?.orders)) {
+      const paidOrders = snapshot.orders.filter(o => o && (o.status === 'paid' || o.paymentStatus === 'paid'));
+      const activeOrders = snapshot.orders.filter(o => o && o.status !== 'paid' && o.paymentStatus !== 'paid');
+      state.orders = safeClone(paidOrders);
+      state.activeOrders = safeClone(activeOrders);
+    }
+
+    const uiState = settingsData.uiState && typeof settingsData.uiState === 'object'
+      ? settingsData.uiState
+      : (snapshot?.uiState || null);
+    if (uiState) {
+      Object.keys(uiState).forEach(key => {
+        state[key] = safeClone(uiState[key]);
+      });
+    }
+
+    // Do not run the Phase 2 default-data normalizer here. Cloud hydration
+    // must not invent categories, products, tables, inventory, or staff.
+    state.orders = Array.isArray(state.orders) ? state.orders.map(normalizeOrder).filter(Boolean) : [];
+    state.activeOrders = Array.isArray(state.activeOrders) ? state.activeOrders.map(normalizeOrder).filter(Boolean) : [];
+    state.categories = Array.isArray(state.categories) ? state.categories : [];
+    state.products = Array.isArray(state.products) ? state.products : [];
+    state.inventory = Array.isArray(state.inventory) ? state.inventory : [];
+    state.tables = Array.isArray(state.tables) ? state.tables : [];
+    state.staff = Array.isArray(state.staff) ? state.staff : [];
+    state.orderSequence = Number(state.orderSequence || 0);
+    if (!state.orderSequence) {
+      const existingSeq = [...state.orders, ...state.activeOrders]
+        .map(o => Number(o?.sequenceNo) || getOrderSequenceFromCode(o?.code) || 0)
+        .filter(Boolean);
+      state.orderSequence = existingSeq.length ? Math.max(...existingSeq) + 1 : 1;
+    }
+
+    const liveIds = new Set(state.activeOrders.map(o => o.id));
+    state.tables.forEach(t => {
+      if (t && t.orderId && !liveIds.has(t.orderId)) t.orderId = null;
+    });
+  }
+
+  async function prepareCloudSession(uidValue) {
+    cloudUserUid = uidValue;
+    cloudReady = false;
+
+    try {
+      console.info(`[1911 Firestore] checking ${CLOUD_ROOT_COLLECTION}/${uidValue} business data`);
+      let cloud = await readCloudBusinessState(uidValue);
+      const localExists = hasLocalPhase2Data();
+
+      // First migration is driven only by actual cloud business-record
+      // existence. No migration flag can block hydration.
+      if (!cloudHasBusinessData(cloud) && localExists) {
+        const localSnapshot = extractCloudState();
+        console.info('[1911 Firestore] no cloud business data found; migrating local Phase 2 data');
+        await writeMissingCloudRecords(uidValue, localSnapshot, cloud);
+        cloud = await readCloudBusinessState(uidValue);
+      }
+
+      if (cloudHasBusinessData(cloud)) {
+        applyCloudState(cloud);
+        cloudReady = true;
+        console.info(`[1911 Firestore] hydrated business data (${cloudRecordCount(cloud)} cloud records)`);
+        return;
+      }
+
+      console.info('[1911 Firestore] no cloud business data and no local migration source; keeping Phase 2 local state');
+    } catch (error) {
+      cloudReady = false;
+      console.warn('[1911 Firestore] availability/hydration failed; localStorage fallback preserved', error?.code || 'firestore/error', error?.message || error);
+    }
+  }
+
+  async function syncStateToCloud() {
+    if (!cloudReady || !cloudUserUid || cloudSyncInFlight) {
+      if (cloudReady && cloudUserUid) cloudSyncQueued = true;
+      return;
+    }
+
+    cloudSyncInFlight = true;
+    cloudSyncQueued = false;
+    const snapshot = extractCloudState();
+
+    try {
+      const writes = [];
+      const deleteOps = [];
+
+      const currentByCollection = {
+        categories: snapshot.categories,
+        inventory: snapshot.inventory,
+        orders: snapshot.orders,
+        products: snapshot.products,
+        staff: snapshot.staff,
+        tables: snapshot.tables
+      };
+
+      for (const name of CLOUD_COLLECTIONS) {
+        const currentIds = new Set((currentByCollection[name] || []).map(r => String(r.id)));
+        for (const record of currentByCollection[name] || []) {
+          if (!record?.id) continue;
+          writes.push({ ref: cloudDocRef(cloudUserUid, name, record.id), data: safeClone(record) });
+        }
+        for (const oldId of cloudKnownIds[name]) {
+          if (!currentIds.has(String(oldId))) deleteOps.push(cloudDocRef(cloudUserUid, name, oldId));
+        }
+      }
+
+      writes.push({
+        ref: cloudSettingsRef(cloudUserUid),
+        data: {
+          schemaVersion: 1,
+          settings: safeClone(snapshot.settings || {}),
+          uiState: safeClone(snapshot.uiState || {}),
+          updatedAt: Date.now()
+        }
+      });
+
+      const operations = [
+        ...writes.map(write => ({ type: 'set', ref: write.ref, data: write.data })),
+        ...deleteOps.map(ref => ({ type: 'delete', ref }))
+      ];
+      for (let i = 0; i < operations.length; i += 450) {
+        const batch = writeBatch(db);
+        operations.slice(i, i + 450).forEach(operation => {
+          if (operation.type === 'delete') batch.delete(operation.ref);
+          else batch.set(operation.ref, operation.data);
+        });
+        await batch.commit();
+      }
+
+      CLOUD_COLLECTIONS.forEach(name => {
+        cloudKnownIds[name] = new Set((currentByCollection[name] || []).map(r => String(r.id)));
+      });
+      console.info('[1911 Firestore] business state saved');
+    } catch (error) {
+      console.warn('[1911 Firestore] save failed; localStorage remains the operational fallback', error?.code || 'firestore/error', error?.message || error);
+    } finally {
+      cloudSyncInFlight = false;
+      if (cloudSyncQueued) queueCloudSync();
+    }
+  }
+
+  function queueCloudSync() {
+    if (!cloudReady || !cloudUserUid) return;
+    if (cloudSyncTimer) clearTimeout(cloudSyncTimer);
+    cloudSyncTimer = setTimeout(() => {
+      cloudSyncTimer = null;
+      syncStateToCloud();
+    }, 450);
+  }
+
+  async function flushCloudSync() {
+    if (cloudSyncTimer) {
+      clearTimeout(cloudSyncTimer);
+      cloudSyncTimer = null;
+    }
+    if (!cloudReady || !cloudUserUid) return;
+    if (cloudSyncInFlight) return;
+    await syncStateToCloud();
+  }
+
   function uid(prefix = 'id') {
     return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
   }
@@ -1871,7 +2202,12 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function saveState() {
-    localStorage.setItem(STORE_KEY, JSON.stringify(state));
+    try {
+      localStorage.setItem(STORE_KEY, JSON.stringify(state));
+    } catch (error) {
+      console.warn('[1911 POS] localStorage save failed', error);
+    }
+    queueCloudSync();
   }
 
   function safeClone(v) {
@@ -2783,12 +3119,14 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
     const profile = await loadStaffProfile(user);
 
+    // Preserve the working Phase 2 authentication flow. Firestore business
+    // hydration happens only after Firebase has authenticated the user and the
+    // staff profile has been verified. Nothing is rendered before hydration.
     sessionProfile = profile;
     processedAuthUid = uid;
-    authReady = true;
+    setAuthStateView('loading', 'Loading POS data...', '', true);
+    await prepareCloudSession(uid);
 
-    // Authentication only establishes identity/access. It never reloads,
-    // merges, appends, or recreates POS business records.
     state.currentStaffId =
       state.staff.find(
         st => st.name === profile.name &&
@@ -2798,6 +3136,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       state.staff[0]?.id ||
       null;
 
+    authReady = true;
     saveState();
     setAuthStateView('ready', `Signed in as ${profile.name}.`, '', false);
 
@@ -2833,6 +3172,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
   async function handleLogout() {
     try {
+      await flushCloudSync();
       await signOut(auth);
       // Keep the existing localStorage POS state intact.
     } catch (error) {
