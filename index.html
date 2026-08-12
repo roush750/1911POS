@@ -1835,8 +1835,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
         if (!uid) throw new Error('No authenticated Firebase UID.');
 
         const started = Date.now();
-        const diagnosticRef = doc(db, '1911POS', String(uid), '_diagnostics', 'optimizedWrite');
-        await setDoc(diagnosticRef, {
+        await setDoc(doc(db, '1911POS', String(uid), '_diagnostics', 'optimizedWrite'), {
           ok: true,
           uid: String(uid),
           testedAt: Date.now(),
@@ -1844,11 +1843,11 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
         }, { merge: false });
 
         setCloudDiagnostic({
-          status: '2/3 — SDK write acknowledged. Reading it back…',
+          status: '2/3 — SDK write succeeded. Reading it back…',
           lastAction: 'Canonical SDK diagnostic write'
         });
 
-        const snap = await getDoc(diagnosticRef);
+        const snap = await getDoc(doc(db, '1911POS', String(uid), '_diagnostics', 'optimizedWrite'));
         if (!snap.exists()) throw new Error('SDK write returned successfully but the diagnostic document could not be read back.');
 
         setCloudDiagnostic({
@@ -2254,19 +2253,15 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     return readLegacyCloudBusinessState(uid);
   }
 
-  // Firestore Web SDK writes are intentionally fire-and-forget here.
-  // Firebase documents that setDoc() updates the local cache immediately, while
-  // its returned Promise waits for the remote backend acknowledgement. Awaiting
-  // that Promise can block application logic indefinitely when connectivity is
-  // poor. We therefore queue the write and observe acknowledgement separately.
-  // See Firebase's Firestore Web SDK documentation for setDoc()/waitForPendingWrites.
-  function queueCanonicalStateWrite(uid, business) {
+  async function writeCanonicalStateOnce(uid, business) {
     const payload = {
       version: 1,
       savedAt: Date.now(),
       businessState: business
     };
 
+    // Firestore documents have a 1 MiB limit. Keep a safety margin so a
+    // near-limit payload never reaches the network.
     const estimatedBytes = new Blob([JSON.stringify(payload)]).size;
     if (estimatedBytes > 950000) {
       const e = new Error(`Canonical POS state is too large for one Firestore document (${Math.round(estimatedBytes / 1024)} KiB).`);
@@ -2274,63 +2269,37 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       throw e;
     }
 
-    const startedAt = Date.now();
-    const ref = canonicalStateRef(uid);
-
-    // Do NOT await this promise. The SDK immediately applies the write to its
-    // local cache and queues it for the backend. This keeps the POS responsive
-    // even when the network acknowledgement is delayed.
-    const writePromise = setDoc(ref, payload, { merge: false });
-
-    setCloudDiagnostic({
-      uid: String(uid),
-      status: 'Cloud sync queued locally — waiting for Firebase acknowledgement…',
-      lastAction: 'Cloud write queued',
-      counts: {
-        categories: business.categories.length, products: business.products.length, inventory: business.inventory.length,
-        orders: business.orders.length, tables: business.tables.length, staff: business.staff.length
-      },
-      extra: '1 canonical document queued. POS remains usable while Firebase sends it in the background.',
-      lastError: ''
-    });
-
-    writePromise.then(async () => {
-      // waitForPendingWrites is deliberately not used to block the POS. The
-      // resolved setDoc promise already means this write was acknowledged.
-      lastCloudPayloadSignature = cloudPayloadSignature(business);
-      cloudNeedsCanonicalWrite = false;
-      setCloudDiagnostic({
-        uid: String(uid),
-        status: 'Firebase upload acknowledged ✓',
-        lastAction: 'Cloud write acknowledged',
-        lastSyncAt: Date.now(),
-        counts: {
-          categories: business.categories.length, products: business.products.length, inventory: business.inventory.length,
-          orders: business.orders.length, tables: business.tables.length, staff: business.staff.length
-        },
-        writes: Number(cloudDiagnostics.writes || 0) + 1,
-        deletes: 0,
-        source: localStateWasPresent ? 'localStorage' : 'application',
-        mode: localStateWasPresent ? 'localStorage' : 'application',
-        extra: `Canonical cloud document: 1911POS/{uid}/state/main · acknowledged in ${((Date.now() - startedAt) / 1000).toFixed(1)}s`,
-        lastError: ''
-      });
-    }).catch((error) => {
-      setCloudDiagnostic({
-        uid: String(uid),
-        status: 'Firebase background write FAILED',
-        lastAction: 'Cloud write acknowledgement',
-        lastError: formatFirestoreError(error),
-        source: localStateWasPresent ? 'localStorage' : 'application',
-        mode: localStateWasPresent ? 'localStorage' : 'application'
-      });
-      console.warn('Firestore background write failed:', error?.code || error?.message || error);
-    });
-
-    return { queued: true };
+    // Use the Firebase Web SDK directly. The previous REST path returned
+    // HTTP 429 even though the Firebase console could write successfully.
+    // The SDK also provides the browser's normal Firestore network/offline
+    // queue instead of forcing a separate REST transport.
+    await setDoc(canonicalStateRef(uid), payload, { merge: false });
+    return true;
   }
 
-  function writeCloudBusinessState(uid, source = 'localStorage', force = false) {
+  async function writeCanonicalStateWithRetry(uid, business) {
+    let lastError = null;
+    // Do not hammer Firestore. A single failed attempt followed by a sparse
+    // retry is enough; normal POS changes are coalesced by scheduleCloudPersistence.
+    const delays = [0, 5000];
+    for (let attempt = 0; attempt < delays.length; attempt++) {
+      if (delays[attempt]) await new Promise(resolve => setTimeout(resolve, delays[attempt]));
+      try {
+        return await writeCanonicalStateOnce(uid, business);
+      } catch (error) {
+        lastError = error;
+        const retryableCodes = new Set([
+          'unavailable', 'deadline-exceeded', 'aborted', 'resource-exhausted',
+          'firestore/rest-429', 'firestore/rest-timeout'
+        ]);
+        const retryable = retryableCodes.has(String(error?.code || '').toLowerCase());
+        if (!retryable || attempt === delays.length - 1) throw error;
+      }
+    }
+    throw lastError || new Error('Firestore write failed.');
+  }
+
+  async function writeCloudBusinessState(uid, source = 'localStorage', force = false) {
     const business = businessStateForCloud();
     const signature = cloudPayloadSignature(business);
 
@@ -2352,7 +2321,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
     setCloudDiagnostic({
       uid: String(uid),
-      status: 'Saving optimized POS state locally + queuing Firebase upload…',
+      status: 'Uploading optimized POS state to Firebase…',
       lastAction: `Cloud write (${source})`,
       source,
       mode: source,
@@ -2363,13 +2332,31 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       lastError: ''
     });
 
-    const result = queueCanonicalStateWrite(uid, business);
-    // Mark this state as submitted immediately. A later user change will create
-    // a new signature and queue a newer canonical state. If the network is down,
-    // Firestore's offline queue keeps the write pending until connectivity returns.
+    await writeCanonicalStateWithRetry(uid, business);
+
     lastCloudPayloadSignature = signature;
     cloudNeedsCanonicalWrite = false;
-    return result;
+
+    const counts = {
+      categories: business.categories.length, products: business.products.length, inventory: business.inventory.length,
+      orders: business.orders.length, tables: business.tables.length, staff: business.staff.length
+    };
+
+    setCloudDiagnostic({
+      uid: String(uid),
+      status: 'Firebase upload successful',
+      lastAction: `Cloud write (${source}) → 1 document`,
+      lastSyncAt: Date.now(),
+      counts,
+      writes: 1,
+      deletes: 0,
+      source,
+      mode: source,
+      extra: 'Canonical cloud document: 1911POS/{uid}/state/main · Firebase Web SDK setDoc · writes only when business state changes',
+      lastError: ''
+    });
+
+    return { skipped: false };
   }
 
   function scheduleCloudPersistence(force = false) {
@@ -2379,7 +2366,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     clearTimeout(cloudSyncTimer);
     cloudSyncTimer = setTimeout(() => {
       persistCurrentStateToCloud(force).catch((error) => {
-        console.warn('Firestore persistence scheduling failed:', error?.code || error?.message || error);
+        console.warn('Firestore persistence failed:', error?.code || error?.message || error);
       });
     }, 500);
   }
@@ -2389,11 +2376,16 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       return { skipped: true };
     }
 
-    // Do not hold a long-lived lock on the POS while Firebase waits for a server
-    // acknowledgement. The SDK owns the actual network queue.
+    if (cloudSyncInFlight) {
+      cloudSyncPending = true;
+      return { pending: true };
+    }
+
+    cloudSyncInFlight = true;
     cloudSyncPending = false;
+
     try {
-      const result = writeCloudBusinessState(
+      const result = await writeCloudBusinessState(
         sessionProfile.uid,
         localStateWasPresent ? 'localStorage' : 'application',
         force
@@ -2404,14 +2396,20 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       const formatted = formatFirestoreError(error);
       setCloudDiagnostic({
         uid: String(sessionProfile.uid),
-        status: 'Firebase upload could not be queued',
-        lastAction: 'Cloud write queue',
+        status: 'Firebase upload FAILED',
+        lastAction: 'Cloud write',
         lastError: formatted,
         source: localStateWasPresent ? 'localStorage' : 'application',
         mode: localStateWasPresent ? 'localStorage' : 'application'
       });
-      console.warn('Firestore persistence queue failed:', error?.code || error?.message || error);
+      console.warn('Firestore persistence failed:', error?.code || error?.message || error);
       return { failed: true, error };
+    } finally {
+      cloudSyncInFlight = false;
+      if (cloudSyncPending) {
+        cloudSyncPending = false;
+        scheduleCloudPersistence(false);
+      }
     }
   }
 
