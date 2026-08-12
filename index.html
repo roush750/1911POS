@@ -2444,6 +2444,117 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     }
   }
 
+  function mergeLegacyRecordArrays(localRecords, cloudRecords, name) {
+    const merged = [];
+    const byKey = new Map();
+
+    const add = (raw, preferExisting = true) => {
+      if (!raw) return;
+      const record = safeClone(raw);
+      const key = cloudRecordKey(name, record) || `id:${record.id || uid(name.slice(0, 3))}`;
+      if (!byKey.has(key)) {
+        byKey.set(key, merged.length);
+        merged.push(record);
+        return;
+      }
+      if (!preferExisting) {
+        merged[byKey.get(key)] = record;
+      } else {
+        const existing = merged[byKey.get(key)];
+        // Keep the local record as the authoritative version, but fill in
+        // useful fields that may exist only in the cloud copy.
+        if (name === 'products') {
+          if (!existing.image && record.image) existing.image = record.image;
+          if (!existing.description && record.description) existing.description = record.description;
+          if ((!Array.isArray(existing.variants) || !existing.variants.length) && Array.isArray(record.variants)) existing.variants = record.variants;
+          if ((!Array.isArray(existing.recipe) || !existing.recipe.length) && Array.isArray(record.recipe)) existing.recipe = record.recipe;
+        }
+        if (name === 'tables') {
+          if (!existing.orderId && record.orderId) existing.orderId = record.orderId;
+          if (!existing.lastClosedAt && record.lastClosedAt) existing.lastClosedAt = record.lastClosedAt;
+        }
+      }
+    };
+
+    (Array.isArray(localRecords) ? localRecords : []).forEach(r => add(r, true));
+    (Array.isArray(cloudRecords) ? cloudRecords : []).forEach(r => add(r, true));
+    return merged;
+  }
+
+  function applyLegacyCloudBusinessState(cloud) {
+    const d = defaultState();
+    const hadLocalState = Boolean(localStateWasPresent);
+
+    state.settings = {
+      ...d.settings,
+      ...(cloud?.settings?.settings || cloud?.settings || {}),
+      ...(hadLocalState ? (state.settings || {}) : {})
+    };
+
+    state.categories = hadLocalState
+      ? mergeLegacyRecordArrays(state.categories, cloud?.categories, 'categories')
+      : dedupeRecords(cloud?.categories || [], 'categories');
+    state.products = hadLocalState
+      ? mergeLegacyRecordArrays(state.products, cloud?.products, 'products')
+      : dedupeRecords(cloud?.products || [], 'products');
+    state.inventory = hadLocalState
+      ? mergeLegacyRecordArrays(state.inventory, cloud?.inventory, 'inventory')
+      : dedupeRecords(cloud?.inventory || [], 'inventory');
+    state.tables = hadLocalState
+      ? mergeLegacyRecordArrays(state.tables, cloud?.tables, 'tables')
+      : dedupeRecords(cloud?.tables || [], 'tables');
+    state.staff = hadLocalState
+      ? mergeLegacyRecordArrays(state.staff, cloud?.staff, 'staff')
+      : dedupeRecords(cloud?.staff || [], 'staff');
+
+    const localOrders = hadLocalState
+      ? dedupeRecords([...(state.orders || []), ...(state.activeOrders || [])], 'orders')
+      : [];
+    const cloudOrders = dedupeRecords(cloud?.orders || [], 'orders');
+    const allOrders = hadLocalState
+      ? mergeLegacyRecordArrays(localOrders, cloudOrders, 'orders')
+      : cloudOrders;
+
+    state.activeOrders = allOrders.filter(order => order && order.status !== 'paid' && order.paymentStatus !== 'paid');
+    state.orders = allOrders.filter(order => order && (order.status === 'paid' || order.paymentStatus === 'paid'));
+    state.orderSequence = Math.max(
+      Number(state.orderSequence || 0),
+      Number(cloud?.orderSequence || 0),
+      Number(cloud?.settings?.orderSequence || 0),
+      1
+    );
+    state.currentOrderId = null;
+    state.adminSelection = null;
+    dedupeStateInMemory();
+    ensureCurrentStaff();
+  }
+
+  function firestoreRestValue(value) {
+    if (value === null || value === undefined) return { nullValue: null };
+    if (typeof value === 'boolean') return { booleanValue: value };
+    if (typeof value === 'number') {
+      if (!Number.isFinite(value)) return { nullValue: null };
+      return Number.isInteger(value) ? { integerValue: String(value) } : { doubleValue: value };
+    }
+    if (typeof value === 'string') return { stringValue: value };
+    if (Array.isArray(value)) return { arrayValue: { values: value.map(firestoreRestValue) } };
+    if (typeof value === 'object') {
+      const fields = {};
+      Object.entries(value).forEach(([key, child]) => { fields[key] = firestoreRestValue(child); });
+      return { mapValue: { fields } };
+    }
+    return { stringValue: String(value) };
+  }
+
+  function firestoreRestFields(record) {
+    const fields = {};
+    Object.entries(record || {}).forEach(([key, value]) => {
+      if (key === '__name__') return;
+      fields[key] = firestoreRestValue(value);
+    });
+    return fields;
+  }
+
   async function hydrateOrMigrateCloudState(uid) {
     cloudHydrationInProgress = true;
     cloudPersistenceEnabled = false;
