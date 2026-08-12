@@ -1693,7 +1693,7 @@
 <script type="module">
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js';
 import { getAuth, setPersistence, browserLocalPersistence, onAuthStateChanged, signInWithEmailAndPassword, signOut } from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js';
-import { initializeFirestore, doc, getDoc, getDocs, collection, setDoc, writeBatch } from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js';
+import { initializeFirestore, doc, getDoc, getDocs, collection, setDoc } from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js';
 
 const firebaseConfig = {
   apiKey: "AIzaSyB_m-lt22FJ7fShyRHDgPEbkYTSOzMpMYM",
@@ -2204,6 +2204,63 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     ensureCurrentStaff();
   }
 
+  function firestoreRestValue(value) {
+    if (value === null || value === undefined) return { nullValue: null };
+    if (typeof value === 'boolean') return { booleanValue: value };
+    if (typeof value === 'number') {
+      if (!Number.isFinite(value)) return { nullValue: null };
+      return Number.isInteger(value) ? { integerValue: String(value) } : { doubleValue: value };
+    }
+    if (typeof value === 'string') return { stringValue: value };
+    if (Array.isArray(value)) return { arrayValue: { values: value.map(firestoreRestValue) } };
+    if (typeof value === 'object') {
+      const fields = {};
+      Object.entries(value).forEach(([k, v]) => { fields[k] = firestoreRestValue(v); });
+      return { mapValue: { fields } };
+    }
+    return { stringValue: String(value) };
+  }
+
+  function firestoreRestFields(record) {
+    const fields = {};
+    Object.entries(record || {}).forEach(([key, value]) => {
+      if (key === '__name__') return;
+      fields[key] = firestoreRestValue(value);
+    });
+    return fields;
+  }
+
+  function firestoreRestDocumentName(uid, collectionName, documentId) {
+    const encode = (v) => encodeURIComponent(String(v));
+    return `projects/${firebaseConfig.projectId}/databases/(default)/documents/1911POS/${encode(uid)}/${encode(collectionName)}/${encode(documentId)}`;
+  }
+
+  async function firestoreRestCommit(uid, writes) {
+    if (!writes.length) return;
+    const user = auth.currentUser;
+    if (!user || user.uid !== String(uid)) throw new Error('No authenticated Firebase user for Firestore REST write.');
+    const idToken = await user.getIdToken(true);
+    const endpoint = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/(default)/documents:commit`;
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${idToken}`
+      },
+      body: JSON.stringify({ writes })
+    });
+    const text = await response.text();
+    let payload = null;
+    try { payload = text ? JSON.parse(text) : null; } catch (_) {}
+    if (!response.ok) {
+      const message = payload?.error?.message || text || `HTTP ${response.status}`;
+      const error = new Error(`Firestore REST write failed: ${message}`);
+      error.code = `firestore/rest-${response.status}`;
+      throw error;
+    }
+    return payload;
+  }
+
   async function writeCloudBusinessState(uid, source = 'localStorage') {
     const business = businessStateForCloud();
     setCloudDiagnostic({ uid: String(uid), status: 'Uploading to Firebase…', lastAction: `Cloud write (${source})`, source, mode: source, lastError: '' });
@@ -2213,59 +2270,62 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       for (const record of business[name]) {
         if (!record?.id) continue;
         desiredByCollection[name].set(String(record.id), record);
-        writes.push([cloudDocRef(uid, name, record.id), record]);
+        writes.push({ update: { name: firestoreRestDocumentName(uid, name, record.id), fields: firestoreRestFields(record) } });
       }
     }
 
-    // Phase 3 must be authoritative for the signed-in POS account: write the
-    // current records and delete stale/duplicate Firestore documents that are
-    // no longer part of the cleaned in-memory state.
+    // Read existing documents with the SDK, but perform all writes through the
+    // authenticated Firestore REST commit endpoint. This bypasses the Web SDK
+    // write transport that was hanging on this browser/network while leaving
+    // the existing Firestore rules and data model unchanged.
     const existingSnapshots = await Promise.all(
       CLOUD_COLLECTIONS.map(name => getDocs(cloudCollectionRef(uid, name)))
     );
 
-    const chunkSize = 400;
-    for (let i = 0; i < writes.length; i += chunkSize) {
-      const batch = writeBatch(db);
-      writes.slice(i, i + chunkSize).forEach(([ref, record]) => batch.set(ref, record));
-      await batch.commit();
-    }
-
-    const deleteRefs = [];
+    const deleteWrites = [];
     CLOUD_COLLECTIONS.forEach((name, index) => {
       existingSnapshots[index].docs.forEach(snap => {
         if (!desiredByCollection[name].has(String(snap.id))) {
-          deleteRefs.push(cloudDocRef(uid, name, snap.id));
+          deleteWrites.push({ delete: firestoreRestDocumentName(uid, name, snap.id) });
         }
       });
     });
-    for (let i = 0; i < deleteRefs.length; i += chunkSize) {
-      const batch = writeBatch(db);
-      deleteRefs.slice(i, i + chunkSize).forEach(ref => batch.delete(ref));
-      await batch.commit();
+
+    const allWrites = [...writes, ...deleteWrites];
+    const chunkSize = 400;
+    let committed = 0;
+    for (let i = 0; i < allWrites.length; i += chunkSize) {
+      const chunk = allWrites.slice(i, i + chunkSize);
+      setCloudDiagnostic({ uid: String(uid), status: `Uploading to Firebase… ${Math.min(i + chunk.length, allWrites.length)}/${allWrites.length}`, lastAction: 'Firestore REST commit', source, mode: source, lastError: '' });
+      await firestoreRestCommit(uid, chunk);
+      committed += chunk.length;
     }
 
-    await setDoc(cloudSettingsRef(uid), {
-      settings: business.settings,
-      orderSequence: business.orderSequence,
-      updatedAt: Date.now()
-    }, { merge: true });
-    await setDoc(cloudMigrationRef(uid), {
-      status: 'completed',
-      informationalOnly: true,
-      source,
-      migratedAt: Date.now(),
-      counts: Object.fromEntries(CLOUD_COLLECTIONS.map(name => [name, business[name].length]))
-    }, { merge: true });
+    // Settings/migration metadata are also written through the same REST path.
+    const metadataWrites = [
+      {
+        update: {
+          name: `projects/${firebaseConfig.projectId}/databases/(default)/documents/1911POS/${encodeURIComponent(String(uid))}/settings/main`,
+          fields: firestoreRestFields({ settings: business.settings, orderSequence: business.orderSequence, updatedAt: Date.now() })
+        }
+      },
+      {
+        update: {
+          name: `projects/${firebaseConfig.projectId}/databases/(default)/documents/1911POS/${encodeURIComponent(String(uid))}/meta/migration`,
+          fields: firestoreRestFields({ status: 'completed', informationalOnly: true, source, migratedAt: Date.now(), counts: Object.fromEntries(CLOUD_COLLECTIONS.map(name => [name, business[name].length])) })
+        }
+      }
+    ];
+    await firestoreRestCommit(uid, metadataWrites);
 
     const counts = Object.fromEntries(CLOUD_COLLECTIONS.map(name => [name, business[name].length]));
     const existingCount = existingSnapshots.reduce((sum, snap) => sum + snap.size, 0);
     const desiredCount = writes.length;
-    const deletedCount = Math.max(0, existingCount - desiredCount);
+    const deletedCount = deleteWrites.length;
     setCloudDiagnostic({
       uid: String(uid),
       status: 'Firebase upload successful',
-      lastAction: `Cloud write (${source})`,
+      lastAction: `Cloud write (${source}) via Firestore REST`,
       lastSyncAt: Date.now(),
       counts,
       writes: desiredCount,
