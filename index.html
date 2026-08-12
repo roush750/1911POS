@@ -1712,6 +1712,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
 (() => {
   const STORE_KEY = '1911CafePOS:v1';
+  const CLOUD_DIRTY_KEY = STORE_KEY + ':cloudDirty';
   const $ = (id) => document.getElementById(id);
 
   const AUTH_UID_PATH = '1911POS/{uid}';
@@ -1835,7 +1836,8 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
         if (!uid) throw new Error('No authenticated Firebase UID.');
 
         const started = Date.now();
-        await setDoc(doc(db, '1911POS', String(uid), '_diagnostics', 'optimizedWrite'), {
+        const diagnosticRef = doc(db, '1911POS', String(uid), '_diagnostics', 'optimizedWrite');
+        await setDoc(diagnosticRef, {
           ok: true,
           uid: String(uid),
           testedAt: Date.now(),
@@ -1843,11 +1845,11 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
         }, { merge: false });
 
         setCloudDiagnostic({
-          status: '2/3 — SDK write succeeded. Reading it back…',
+          status: '2/3 — SDK write acknowledged. Reading it back…',
           lastAction: 'Canonical SDK diagnostic write'
         });
 
-        const snap = await getDoc(doc(db, '1911POS', String(uid), '_diagnostics', 'optimizedWrite'));
+        const snap = await getDoc(diagnosticRef);
         if (!snap.exists()) throw new Error('SDK write returned successfully but the diagnostic document could not be read back.');
 
         setCloudDiagnostic({
@@ -2031,9 +2033,22 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     return defaultState();
   }
 
+  function markCloudDirty() {
+    try { localStorage.setItem(CLOUD_DIRTY_KEY, '1'); } catch (_) {}
+  }
+  function clearCloudDirty() {
+    try { localStorage.removeItem(CLOUD_DIRTY_KEY); } catch (_) {}
+  }
+  function isCloudDirty() {
+    try { return localStorage.getItem(CLOUD_DIRTY_KEY) === '1'; } catch (_) { return false; }
+  }
+
   function saveState() {
     try {
       localStorage.setItem(STORE_KEY, JSON.stringify(state));
+      // Never let a pending/failed cloud write destroy Phase 2 persistence.
+      // The dirty marker survives refresh until Firebase acknowledges the write.
+      if (!cloudHydrationInProgress) markCloudDirty();
     } catch (e) {
       console.warn('localStorage save failed:', e);
     }
@@ -2133,14 +2148,60 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     return result;
   }
 
+  function dedupeProductsAndRepairOrders(products, orders) {
+    const source = Array.isArray(products) ? products : [];
+    const allOrders = Array.isArray(orders) ? orders : [];
+    const clean = (v) => String(v ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
+    const fingerprint = (p) => [clean(p?.name), Number(p?.price || 0), clean(p?.description)].join('|');
+    const usage = new Map();
+    allOrders.forEach(order => (order?.items || []).forEach(item => {
+      if (item?.productId) usage.set(item.productId, (usage.get(item.productId) || 0) + Number(item.qty || 1));
+    }));
+    const groups = new Map();
+    source.forEach(product => {
+      const key = fingerprint(product);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(product);
+    });
+    const idMap = new Map();
+    const result = [];
+    for (const group of groups.values()) {
+      // Keep the copy used by the most order items. Older Phase 3 migrations
+      // could have created extra product documents from ordered items.
+      group.sort((a,b) => (usage.get(b?.id) || 0) - (usage.get(a?.id) || 0));
+      const survivor = group[0];
+      result.push(survivor);
+      group.slice(1).forEach(duplicate => {
+        if (duplicate?.id && survivor?.id) idMap.set(duplicate.id, survivor.id);
+      });
+    }
+    if (idMap.size) {
+      const byId = new Map(result.filter(Boolean).map(p => [p.id, p]));
+      allOrders.forEach(order => (order?.items || []).forEach(item => {
+        const survivorId = idMap.get(item.productId);
+        if (!survivorId) return;
+        item.productId = survivorId;
+        const product = byId.get(survivorId);
+        if (product) {
+          item.productName = product.name;
+          item.unitPrice = Number(product.price || item.unitPrice || 0);
+          item.categoryId = product.categoryId;
+          item.description = product.description || '';
+          item.image = product.image || '';
+        }
+      }));
+    }
+    return result;
+  }
+
   function dedupeStateInMemory() {
     state.categories = dedupeRecords(state.categories, 'categories');
-    state.products = dedupeRecords(state.products, 'products');
     state.inventory = dedupeRecords(state.inventory, 'inventory');
     state.tables = dedupeRecords(state.tables, 'tables');
     state.staff = dedupeRecords(state.staff, 'staff');
 
     const allOrders = dedupeRecords([...(state.orders || []), ...(state.activeOrders || [])], 'orders');
+    state.products = dedupeProductsAndRepairOrders(state.products, allOrders);
     state.activeOrders = allOrders.filter(order => order && order.status !== 'paid' && order.paymentStatus !== 'paid');
     state.orders = allOrders.filter(order => order && (order.status === 'paid' || order.paymentStatus === 'paid'));
 
@@ -2185,12 +2246,12 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     const business = payload && typeof payload === 'object' ? payload : {};
     state.settings = { ...d.settings, ...(business.settings || {}) };
     state.categories = dedupeRecords(business.categories || [], 'categories');
-    state.products = dedupeRecords(business.products || [], 'products');
     state.inventory = dedupeRecords(business.inventory || [], 'inventory');
     state.tables = dedupeRecords(business.tables || [], 'tables');
     state.staff = dedupeRecords(business.staff || [], 'staff');
 
     const allOrders = dedupeRecords(business.orders || [], 'orders');
+    state.products = dedupeProductsAndRepairOrders(business.products || [], allOrders);
     state.activeOrders = allOrders.filter(order => order && order.status !== 'paid' && order.paymentStatus !== 'paid');
     state.orders = allOrders.filter(order => order && (order.status === 'paid' || order.paymentStatus === 'paid'));
 
@@ -2235,7 +2296,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       const business = payload.businessState || payload;
       const cloud = {
         categories: dedupeRecords(business.categories || [], 'categories'),
-        products: dedupeRecords(business.products || [], 'products'),
+        products: Array.isArray(business.products) ? safeClone(business.products) : [],
         inventory: dedupeRecords(business.inventory || [], 'inventory'),
         orders: dedupeRecords(business.orders || [], 'orders'),
         tables: dedupeRecords(business.tables || [], 'tables'),
@@ -2245,6 +2306,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
         canonical: true,
         hasBusinessRecords: true
       };
+      cloud.products = dedupeProductsAndRepairOrders(cloud.products, cloud.orders);
       return cloud;
     }
 
@@ -2253,15 +2315,19 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     return readLegacyCloudBusinessState(uid);
   }
 
-  async function writeCanonicalStateOnce(uid, business) {
+  // Firestore Web SDK writes are intentionally fire-and-forget here.
+  // Firebase documents that setDoc() updates the local cache immediately, while
+  // its returned Promise waits for the remote backend acknowledgement. Awaiting
+  // that Promise can block application logic indefinitely when connectivity is
+  // poor. We therefore queue the write and observe acknowledgement separately.
+  // See Firebase's Firestore Web SDK documentation for setDoc()/waitForPendingWrites.
+  function queueCanonicalStateWrite(uid, business) {
     const payload = {
       version: 1,
       savedAt: Date.now(),
       businessState: business
     };
 
-    // Firestore documents have a 1 MiB limit. Keep a safety margin so a
-    // near-limit payload never reaches the network.
     const estimatedBytes = new Blob([JSON.stringify(payload)]).size;
     if (estimatedBytes > 950000) {
       const e = new Error(`Canonical POS state is too large for one Firestore document (${Math.round(estimatedBytes / 1024)} KiB).`);
@@ -2269,37 +2335,71 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       throw e;
     }
 
-    // Use the Firebase Web SDK directly. The previous REST path returned
-    // HTTP 429 even though the Firebase console could write successfully.
-    // The SDK also provides the browser's normal Firestore network/offline
-    // queue instead of forcing a separate REST transport.
-    await setDoc(canonicalStateRef(uid), payload, { merge: false });
-    return true;
-  }
+    const startedAt = Date.now();
+    const ref = canonicalStateRef(uid);
 
-  async function writeCanonicalStateWithRetry(uid, business) {
-    let lastError = null;
-    // Do not hammer Firestore. A single failed attempt followed by a sparse
-    // retry is enough; normal POS changes are coalesced by scheduleCloudPersistence.
-    const delays = [0, 5000];
-    for (let attempt = 0; attempt < delays.length; attempt++) {
-      if (delays[attempt]) await new Promise(resolve => setTimeout(resolve, delays[attempt]));
-      try {
-        return await writeCanonicalStateOnce(uid, business);
-      } catch (error) {
-        lastError = error;
-        const retryableCodes = new Set([
-          'unavailable', 'deadline-exceeded', 'aborted', 'resource-exhausted',
-          'firestore/rest-429', 'firestore/rest-timeout'
-        ]);
-        const retryable = retryableCodes.has(String(error?.code || '').toLowerCase());
-        if (!retryable || attempt === delays.length - 1) throw error;
+    // Do NOT await this promise. The SDK immediately applies the write to its
+    // local cache and queues it for the backend. This keeps the POS responsive
+    // even when the network acknowledgement is delayed.
+    const writePromise = setDoc(ref, payload, { merge: false });
+
+    setCloudDiagnostic({
+      uid: String(uid),
+      status: 'Cloud sync queued locally — waiting for Firebase acknowledgement…',
+      lastAction: 'Cloud write queued',
+      counts: {
+        categories: business.categories.length, products: business.products.length, inventory: business.inventory.length,
+        orders: business.orders.length, tables: business.tables.length, staff: business.staff.length
+      },
+      extra: '1 canonical document queued. POS remains usable while Firebase sends it in the background.',
+      lastError: ''
+    });
+
+    writePromise.then(async () => {
+      // waitForPendingWrites is deliberately not used to block the POS. The
+      // resolved setDoc promise already means this write was acknowledged.
+      lastCloudPayloadSignature = cloudPayloadSignature(business);
+      // Only this exact acknowledged payload may clear the dirty marker. If the
+      // user changed the POS while this write was in flight, saveState() will
+      // have marked it dirty again and the newer state remains pending.
+      if (cloudPayloadSignature(businessStateForCloud()) === lastCloudPayloadSignature) {
+        clearCloudDirty();
+        cloudNeedsCanonicalWrite = false;
+      } else {
+        cloudNeedsCanonicalWrite = true;
       }
-    }
-    throw lastError || new Error('Firestore write failed.');
+      setCloudDiagnostic({
+        uid: String(uid),
+        status: 'Firebase upload acknowledged ✓',
+        lastAction: 'Cloud write acknowledged',
+        lastSyncAt: Date.now(),
+        counts: {
+          categories: business.categories.length, products: business.products.length, inventory: business.inventory.length,
+          orders: business.orders.length, tables: business.tables.length, staff: business.staff.length
+        },
+        writes: Number(cloudDiagnostics.writes || 0) + 1,
+        deletes: 0,
+        source: localStateWasPresent ? 'localStorage' : 'application',
+        mode: localStateWasPresent ? 'localStorage' : 'application',
+        extra: `Canonical cloud document: 1911POS/{uid}/state/main · acknowledged in ${((Date.now() - startedAt) / 1000).toFixed(1)}s`,
+        lastError: ''
+      });
+    }).catch((error) => {
+      setCloudDiagnostic({
+        uid: String(uid),
+        status: 'Firebase background write FAILED',
+        lastAction: 'Cloud write acknowledgement',
+        lastError: formatFirestoreError(error),
+        source: localStateWasPresent ? 'localStorage' : 'application',
+        mode: localStateWasPresent ? 'localStorage' : 'application'
+      });
+      console.warn('Firestore background write failed:', error?.code || error?.message || error);
+    });
+
+    return { queued: true };
   }
 
-  async function writeCloudBusinessState(uid, source = 'localStorage', force = false) {
+  function writeCloudBusinessState(uid, source = 'localStorage', force = false) {
     const business = businessStateForCloud();
     const signature = cloudPayloadSignature(business);
 
@@ -2321,7 +2421,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
     setCloudDiagnostic({
       uid: String(uid),
-      status: 'Uploading optimized POS state to Firebase…',
+      status: 'Saving optimized POS state locally + queuing Firebase upload…',
       lastAction: `Cloud write (${source})`,
       source,
       mode: source,
@@ -2332,31 +2432,11 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       lastError: ''
     });
 
-    await writeCanonicalStateWithRetry(uid, business);
-
-    lastCloudPayloadSignature = signature;
-    cloudNeedsCanonicalWrite = false;
-
-    const counts = {
-      categories: business.categories.length, products: business.products.length, inventory: business.inventory.length,
-      orders: business.orders.length, tables: business.tables.length, staff: business.staff.length
-    };
-
-    setCloudDiagnostic({
-      uid: String(uid),
-      status: 'Firebase upload successful',
-      lastAction: `Cloud write (${source}) → 1 document`,
-      lastSyncAt: Date.now(),
-      counts,
-      writes: 1,
-      deletes: 0,
-      source,
-      mode: source,
-      extra: 'Canonical cloud document: 1911POS/{uid}/state/main · Firebase Web SDK setDoc · writes only when business state changes',
-      lastError: ''
-    });
-
-    return { skipped: false };
+    const result = queueCanonicalStateWrite(uid, business);
+    // Do NOT mark the payload as fully synchronized until setDoc() actually
+    // acknowledges it. Until then the local dirty marker remains authoritative
+    // across refreshes.
+    return result;
   }
 
   function scheduleCloudPersistence(force = false) {
@@ -2366,7 +2446,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     clearTimeout(cloudSyncTimer);
     cloudSyncTimer = setTimeout(() => {
       persistCurrentStateToCloud(force).catch((error) => {
-        console.warn('Firestore persistence failed:', error?.code || error?.message || error);
+        console.warn('Firestore persistence scheduling failed:', error?.code || error?.message || error);
       });
     }, 500);
   }
@@ -2376,16 +2456,11 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       return { skipped: true };
     }
 
-    if (cloudSyncInFlight) {
-      cloudSyncPending = true;
-      return { pending: true };
-    }
-
-    cloudSyncInFlight = true;
+    // Do not hold a long-lived lock on the POS while Firebase waits for a server
+    // acknowledgement. The SDK owns the actual network queue.
     cloudSyncPending = false;
-
     try {
-      const result = await writeCloudBusinessState(
+      const result = writeCloudBusinessState(
         sessionProfile.uid,
         localStateWasPresent ? 'localStorage' : 'application',
         force
@@ -2396,20 +2471,14 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       const formatted = formatFirestoreError(error);
       setCloudDiagnostic({
         uid: String(sessionProfile.uid),
-        status: 'Firebase upload FAILED',
-        lastAction: 'Cloud write',
+        status: 'Firebase upload could not be queued',
+        lastAction: 'Cloud write queue',
         lastError: formatted,
         source: localStateWasPresent ? 'localStorage' : 'application',
         mode: localStateWasPresent ? 'localStorage' : 'application'
       });
-      console.warn('Firestore persistence failed:', error?.code || error?.message || error);
+      console.warn('Firestore persistence queue failed:', error?.code || error?.message || error);
       return { failed: true, error };
-    } finally {
-      cloudSyncInFlight = false;
-      if (cloudSyncPending) {
-        cloudSyncPending = false;
-        scheduleCloudPersistence(false);
-      }
     }
   }
 
@@ -2548,7 +2617,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       });
 
       if (cloud.canonical) {
-        applyCanonicalCloudState({
+        const cloudBusiness = {
           categories: cloud.categories,
           products: cloud.products,
           inventory: cloud.inventory,
@@ -2557,12 +2626,42 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
           staff: cloud.staff,
           settings: cloud.settings,
           orderSequence: cloud.orderSequence
-        });
+        };
+        const localBusiness = localStateWasPresent ? businessStateForCloud() : null;
+        const localDiffersFromCloud = Boolean(localBusiness &&
+          cloudPayloadSignature(localBusiness) !== cloudPayloadSignature(cloudBusiness));
+        const localIsDirty = isCloudDirty() || localDiffersFromCloud;
+        if (localIsDirty && localStateWasPresent) {
+          // The browser has local changes that were never confirmed by Firebase.
+          // Keep them instead of replacing them with the older cloud snapshot.
+          dedupeStateInMemory();
+          cloudNeedsCanonicalWrite = true;
+          lastCloudPayloadSignature = '';
+          cloudPersistenceEnabled = true;
+          localStateWasPresent = true;
+          try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch (_) {}
+          scheduleCloudPersistence(true);
+          setCloudDiagnostic({
+            uid: String(uid),
+            status: 'Local state preserved — cloud write pending',
+            lastAction: 'Canonical read detected unacknowledged local changes',
+            lastError: '',
+            counts: {
+              categories: state.categories.length, products: state.products.length, inventory: state.inventory.length,
+              orders: state.orders.length, tables: state.tables.length, staff: state.staff.length
+            },
+            extra: 'Local Phase 2 state was kept. Firebase will be updated in the background.'
+          });
+          return { mode: 'local-newer', hasBusinessRecords: true, canonical: true };
+        }
+
+        applyCanonicalCloudState(cloudBusiness);
 
         lastCloudPayloadSignature = cloudPayloadSignature(businessStateForCloud());
         cloudNeedsCanonicalWrite = false;
         cloudPersistenceEnabled = true;
         localStateWasPresent = true;
+        clearCloudDirty();
 
         try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch (_) {}
 
