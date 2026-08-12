@@ -1769,6 +1769,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
         `Writes: ${cloudDiagnostics.writes}`,
         `Deletes: ${cloudDiagnostics.deletes}`,
         counts ? `Records: ${counts}` : '',
+        cloudDiagnostics.extra ? cloudDiagnostics.extra : '',
         cloudDiagnostics.lastError ? `ERROR: ${cloudDiagnostics.lastError}` : ''
       ].filter(Boolean).join('\n');
     }
@@ -1828,30 +1829,35 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       try {
         const uid = sessionProfile?.uid || auth.currentUser?.uid;
         if (!uid) throw new Error('No authenticated Firebase UID.');
-        setCloudDiagnostic({ status: 'Writing one diagnostic document…', lastAction: `Manual Firebase test write (${uid})` });
+        const testStartedAt = Date.now();
         const ref = doc(db, '1911POS', uid, '_diagnostics', 'connection');
         const payload = { ok: true, uid: String(uid), testedAt: Date.now(), source: '1911POS Phase 3 diagnostic' };
-        // Never leave the diagnostic hanging forever. If Firestore cannot complete
-        // the network write, report that explicitly so we can distinguish a
-        // transport problem from a POS synchronization problem.
-        const timeout = new Promise((_, reject) => setTimeout(() => {
-          const e = new Error('Firestore write timed out after 10 seconds. The browser reached the write call, but Firebase did not complete it.');
-          e.code = 'firestore/write-timeout';
+
+        setCloudDiagnostic({ status: '1/5 — Testing SDK read…', lastAction: 'Full Firebase diagnostic', lastError: '' });
+        const preRead = await getDoc(ref);
+
+        const timeout = (label, ms = 10000) => new Promise((_, reject) => setTimeout(() => {
+          const e = new Error(`${label} timed out after ${ms / 1000} seconds.`);
+          e.code = 'firestore/diagnostic-timeout';
           reject(e);
-        }, 10000));
-        await Promise.race([setDoc(ref, payload, { merge: true }), timeout]);
-        setCloudDiagnostic({ status: 'Write succeeded — reading it back…' });
-        const snap = await getDoc(ref);
-        if (!snap.exists()) throw new Error('Firebase write returned but the test document could not be read back.');
-        setCloudDiagnostic({
-          status: 'Firebase READ + WRITE successful',
-          lastAction: 'Manual Firebase test write',
-          lastReadAt: Date.now(),
-          lastSyncAt: Date.now(),
-          writes: Number(cloudDiagnostics.writes || 0) + 1,
-          lastError: ''
-        });
-        toast('Firebase read/write test passed.');
+        }, ms));
+
+        setCloudDiagnostic({ status: '2/5 — SDK read succeeded. Testing SDK setDoc write…', lastAction: 'Full Firebase diagnostic' });
+        await Promise.race([setDoc(ref, payload, { merge: true }), timeout('Firestore SDK setDoc write')]);
+
+        setCloudDiagnostic({ status: '3/5 — SDK write succeeded. Reading it back…', lastAction: 'Full Firebase diagnostic' });
+        const snap = await Promise.race([getDoc(ref), timeout('Firestore SDK read-back')]);
+        if (!snap.exists()) throw new Error('SDK write returned but the diagnostic document could not be read back.');
+
+        setCloudDiagnostic({ status: '4/5 — SDK READ + WRITE passed. Testing direct Firestore REST write…', lastAction: 'Full Firebase diagnostic' });
+        const restUrl = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(firebaseConfig.projectId)}/databases/(default)/documents/1911POS/${encodeURIComponent(uid)}/_diagnostics/restConnection`;
+        const restBody = { fields: { ok: { booleanValue: true }, uid: { stringValue: String(uid) }, testedAt: { integerValue: String(Date.now()) }, source: { stringValue: '1911POS Phase 3 REST diagnostic' } } };
+        const restResponse = await Promise.race([fetch(restUrl, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(restBody), cache: 'no-store' }), timeout('Direct Firestore REST write')]);
+        const restText = await restResponse.text();
+        if (!restResponse.ok) { const e = new Error(`Direct Firestore REST write failed (${restResponse.status}): ${restText.slice(0, 500)}`); e.code = 'firestore/rest-write-failed'; throw e; }
+
+        setCloudDiagnostic({ status: '5/5 — ALL FIREBASE TESTS PASSED', lastAction: 'Full Firebase diagnostic', lastReadAt: Date.now(), lastSyncAt: Date.now(), writes: Number(cloudDiagnostics.writes || 0) + 2, lastError: '', extra: `Elapsed: ${((Date.now() - testStartedAt) / 1000).toFixed(2)}s | SDK pre-read: ${preRead.exists() ? 'exists' : 'missing'} | REST: HTTP ${restResponse.status}` });
+        toast('All Firebase diagnostics passed.');
       } catch (e) {
         console.error('1911 Firebase diagnostic test failed:', e);
         setCloudDiagnostic({ status: 'FIREBASE TEST FAILED', lastAction: 'Manual Firebase test write', lastError: formatFirestoreError(e) });
