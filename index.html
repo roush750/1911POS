@@ -1713,10 +1713,32 @@ const firebaseConfig = {
   measurementId: "G-RDY676HQLB"
 };
 
-const app = initializeApp(firebaseConfig);
-const auth = getAuth(app);
-const db = getFirestore(app);
-setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Firebase persistence setup failed:', err));
+console.info('[AUTH] Firebase SDK loaded');
+
+let app = null;
+let auth = null;
+let db = null;
+let firebaseInitializationError = null;
+
+try {
+  app = initializeApp(firebaseConfig);
+  console.info('[AUTH] Firebase app initialized');
+
+  auth = getAuth(app);
+  console.info('[AUTH] Auth initialized');
+
+  // Firestore is intentionally initialized AFTER Firebase Auth has produced an
+  // authenticated user. Phase 3 business hydration must never run before Auth.
+} catch (error) {
+  firebaseInitializationError = error;
+  console.error('[AUTH] Firebase initialization failed', error?.code || 'unknown', error?.message || error);
+}
+
+if (auth) {
+  setPersistence(auth, browserLocalPersistence)
+    .then(() => console.info('[AUTH] Auth persistence configured'))
+    .catch((err) => console.warn('[AUTH] Auth persistence setup failed', err?.code || 'unknown', err?.message || err));
+}
 
 (() => {
   const STORE_KEY = '1911CafePOS:v1';
@@ -1899,11 +1921,24 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     showArchivedClosed: true
   });
 
-  let state = loadState();
-  migrateAndNormalize();
-  ensureCurrentStaff();
-  bindEvents();
-  prepareAuthScreen();
+  let state = null;
+
+  // Keep Firebase Auth startup independent from business-state preparation.
+  // If local POS initialization ever throws, the login screen still receives
+  // a real error instead of remaining forever on "Checking authentication...".
+  try {
+    console.info('[AUTH] Preparing Phase 2 local state');
+    state = loadState();
+    migrateAndNormalize();
+    ensureCurrentStaff();
+    bindEvents();
+    console.info('[AUTH] Phase 2 local state prepared');
+  } catch (error) {
+    console.error('[AUTH] Local startup initialization failed', error?.code || 'startup/error', error?.message || error);
+    setAuthStateView('locked', 'POS startup initialization failed.', `${error?.code || 'startup/error'}: ${error?.message || error}`, false);
+  }
+
+  initializeAuthGate();
 
   function uid(prefix = 'id') {
     return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
@@ -3793,55 +3828,55 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   async function loadStaffProfile(user) {
-    try {
-      const staffCollectionRef = getCloudCollectionRef('staff', user.uid);
-      const staffSnap = await getDocs(staffCollectionRef);
+    if (!db) throw new Error('Firestore is not initialized because Firebase Auth has not completed successfully.');
 
-      const cloudStaff = [];
-      staffSnap.forEach(snapshot => {
-        const data = snapshot.data() || {};
-        cloudStaff.push({
-          ...data,
-          id: data.id || snapshot.id
-        });
+    console.info('[AUTH] Starting staff authorization');
+    const uidValue = String(user?.uid || '').trim();
+    if (!uidValue) throw new Error('Firebase authentication did not provide a valid UID.');
+
+    try {
+      // Read-only authorization lookup. This is intentionally performed only
+      // after Firebase Auth has returned a verified user.
+      const rootRef = doc(db, '1911POS', uidValue);
+      const staffCollectionRef = collection(rootRef, 'staff');
+      const staffSnap = await getDocs(staffCollectionRef);
+      const records = [];
+      staffSnap.forEach((snap) => {
+        records.push({ id: snap.id, ...(snap.data() || {}) });
       });
 
-      let profile = cloudStaff.find(st => String(st.uid || '') === String(user.uid));
+      const userEmail = String(user.email || '').trim().toLowerCase();
+      const matches = records.filter((record) => {
+        const recordUid = String(record.uid || record.firebaseUid || record.authUid || '').trim();
+        const recordEmail = String(record.email || '').trim().toLowerCase();
+        return (recordUid && recordUid === uidValue) || (recordEmail && userEmail && recordEmail === userEmail);
+      });
 
-      if (!profile && user.email) {
-        profile = cloudStaff.find(st =>
-          String(st.email || '').toLowerCase() === String(user.email).toLowerCase()
+      const activeRecord = matches.find((record) => record.active !== false)
+        || (matches.length === 1 ? matches[0] : null)
+        || (records.length === 1 && records[0].active !== false ? records[0] : null);
+
+      if (!activeRecord) {
+        throw Object.assign(
+          new Error(`Firebase account authenticated, but no active 1911POS staff profile was found under 1911POS/${uidValue}/staff.`),
+          { code: 'auth/profile-not-found', uid: uidValue }
         );
       }
 
-      // First-run fallback: link the existing Phase 2 staff record to the
-      // authenticated Firebase account before migration.
-      if (!profile) {
-        const localProfile = ensureAuthenticatedStaffLink(user);
-        if (localProfile) profile = localProfile;
-      }
-
-      if (!profile) {
+      if (activeRecord.active === false) {
         throw Object.assign(
-          new Error(`Firebase account authenticated, but no 1911POS staff record is linked to ${user.uid}.`),
-          { code: 'auth/profile-not-found', uid: user.uid }
-        );
-      }
-
-      if (profile.active === false) {
-        throw Object.assign(
-          new Error('Your 1911POS staff profile is inactive.'),
-          { code: 'auth/profile-inactive', uid: user.uid }
+          new Error(`Your 1911POS staff profile is inactive under 1911POS/${uidValue}/staff.`),
+          { code: 'auth/profile-inactive', uid: uidValue }
         );
       }
 
       return {
-        uid: user.uid,
-        id: profile.id || null,
-        email: profile.email || user.email || '',
-        name: profile.name || user.displayName || 'Staff Member',
-        role: String(profile.role || 'STAFF').toUpperCase(),
-        active: profile.active !== false
+        uid: uidValue,
+        id: activeRecord.id,
+        email: activeRecord.email || user.email || '',
+        name: activeRecord.name || user.displayName || 'Staff Member',
+        role: String(activeRecord.role || 'STAFF').toUpperCase(),
+        active: true
       };
     } catch (error) {
       if (String(error?.code || '').startsWith('auth/profile-')) throw error;
@@ -3855,6 +3890,13 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   async function finishSignIn(user) {
     const uid = String(user?.uid || '').trim();
     if (!uid) throw new Error('Firebase authentication did not provide a valid UID.');
+
+    console.info('[AUTH] Current user UID:', uid);
+    if (!db) {
+      console.info('[AUTH] Initializing Firestore after successful authentication');
+      db = getFirestore(app);
+      console.info('[AUTH] Firestore initialized');
+    }
 
     if (processedAuthUid === uid && authReady && sessionProfile) {
       setAuthStateView('ready', `Signed in as ${sessionProfile.name}.`, '', false);
@@ -3925,8 +3967,13 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     authBusy = true;
     setAuthStateView('loading', 'Signing in...', '', true);
     try {
-      await signInWithEmailAndPassword(auth, email, password);
-      // onAuthStateChanged() is the single authoritative auth transition.
+      console.info('[AUTH] Sign-in started');
+      const credential = await signInWithEmailAndPassword(auth, email, password);
+      const signedInUser = credential?.user || auth.currentUser;
+      if (!signedInUser?.uid) throw new Error('Firebase sign-in returned no authenticated user.');
+      console.info('[AUTH] Sign-in successful');
+      console.info('[AUTH] Current user UID:', signedInUser.uid);
+      // onAuthStateChanged() remains the authoritative startup transition.
     } catch (error) {
       authBusy = false;
       authReady = false;
@@ -3950,29 +3997,74 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
   function initializeAuthGate() {
     prepareAuthScreen();
-    onAuthStateChanged(auth, async (user) => {
-      try {
-        if (!user) {
+
+    if (firebaseInitializationError || !auth) {
+      const error = firebaseInitializationError || new Error('Firebase Auth could not be initialized.');
+      console.error('[AUTH] Startup failed during Firebase/Auth initialization', error?.code || 'unknown', error?.message || error);
+      setAuthStateView('locked', 'Firebase authentication failed to initialize.', `${error?.code || 'unknown'}: ${error?.message || error}`, false);
+      return;
+    }
+
+    console.info('[AUTH] Registering auth listener');
+    let firstAuthStateReceived = false;
+    let authTimeout = null;
+
+    const clearAuthTimeout = () => {
+      if (authTimeout) {
+        clearTimeout(authTimeout);
+        authTimeout = null;
+      }
+    };
+
+    try {
+      onAuthStateChanged(auth, async (user) => {
+        firstAuthStateReceived = true;
+        clearAuthTimeout();
+        console.info('[AUTH] Auth listener fired');
+
+        try {
+          if (!user) {
+            console.info('[AUTH] No authenticated user');
+            authBusy = false;
+            authReady = false;
+            sessionProfile = null;
+            processedAuthUid = null;
+            setAuthStateView('locked', 'Sign in to access the POS.', '', false);
+            $('appShell')?.setAttribute('hidden', '');
+            return;
+          }
+
+          authBusy = false;
+          setAuthStateView('loading', 'Verifying staff profile...', '', true);
+          await finishSignIn(user);
+          console.info('[AUTH] Authentication/startup complete');
+        } catch (error) {
           authBusy = false;
           authReady = false;
           sessionProfile = null;
           processedAuthUid = null;
-          setAuthStateView('locked', 'Sign in to access the POS.', '', false);
-          $('appShell')?.setAttribute('hidden', '');
-          return;
+          setAuthStateView('locked', 'Authentication/startup error.', `${error?.code || 'unknown'}: ${error?.message || error}`, false);
+          console.error('[AUTH] Startup stage failed', error?.code || 'unknown', error?.message || error);
         }
-        authBusy = false;
-        setAuthStateView('loading', 'Verifying staff profile...', '', true);
-        await finishSignIn(user);
-      } catch (error) {
+      });
+
+      authTimeout = setTimeout(() => {
+        if (firstAuthStateReceived) return;
+        const error = new Error('Firebase Auth did not report an authentication state within 12 seconds.');
+        console.error('[AUTH] Auth listener timeout', 'auth/initialization-timeout', error.message);
         authBusy = false;
         authReady = false;
-        sessionProfile = null;
-        processedAuthUid = null;
-        setAuthStateView('locked', 'Authentication error.', error.message || String(error), false);
-        console.error(error.code || 'auth/error', error.message || error);
-      }
-    });
+        setAuthStateView('locked', 'Firebase authentication could not be initialized.', `auth/initialization-timeout: ${error.message}`, false);
+      }, 12000);
+    } catch (error) {
+      clearAuthTimeout();
+      authBusy = false;
+      authReady = false;
+      sessionProfile = null;
+      processedAuthUid = null;
+      setAuthStateView('locked', 'Firebase authentication failed to initialize.', `${error?.code || 'unknown'}: ${error?.message || error}`, false);
+      console.error('[AUTH] Auth listener registration failed', error?.code || 'unknown', error?.message || error);
+    }
   }
 
   function renderAll() {
@@ -6611,8 +6703,6 @@ function payOrCloseTakeaway() {
   window.__1911.removeItem = uxRemoveItem;
   window.__1911.editItemNote = uxEditItemNote;
   window.__1911.selectTable = uxSelectTable;
-
-  initializeAuthGate();
 
 })();
 </script>
