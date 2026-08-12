@@ -1693,7 +1693,7 @@
 <script type="module">
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js';
 import { getAuth, setPersistence, browserLocalPersistence, onAuthStateChanged, signInWithEmailAndPassword, signOut } from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js';
-import { initializeFirestore, doc, getDoc, getDocs, collection, setDoc } from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js';
+import { initializeFirestore, doc, getDoc, getDocs, collection, setDoc, persistentLocalCache, persistentMultipleTabManager } from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js';
 
 const firebaseConfig = {
   apiKey: "AIzaSyB_m-lt22FJ7fShyRHDgPEbkYTSOzMpMYM",
@@ -1707,7 +1707,12 @@ const firebaseConfig = {
 
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
-const db = initializeFirestore(app, { experimentalAutoDetectLongPolling: true, ignoreUndefinedProperties: true });
+const db = initializeFirestore(app, {
+  experimentalForceLongPolling: true,
+  experimentalLongPollingOptions: { timeoutSeconds: 25 },
+  localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }),
+  ignoreUndefinedProperties: true
+});
 setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Firebase persistence setup failed:', err));
 
 (() => {
@@ -1827,7 +1832,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       event.preventDefault();
       event.stopPropagation();
       setCloudDiagnostic({
-        status: '1/3 — Testing optimized SDK write…',
+        status: '1/3 — Queueing SDK write locally…',
         lastAction: 'Canonical SDK diagnostic write',
         lastError: ''
       });
@@ -1837,7 +1842,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
         const started = Date.now();
         const diagnosticRef = doc(db, '1911POS', String(uid), '_diagnostics', 'optimizedWrite');
-        await setDoc(diagnosticRef, {
+        const writePromise = setDoc(diagnosticRef, {
           ok: true,
           uid: String(uid),
           testedAt: Date.now(),
@@ -1845,23 +1850,44 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
         }, { merge: false });
 
         setCloudDiagnostic({
-          status: '2/3 — SDK write acknowledged. Reading it back…',
-          lastAction: 'Canonical SDK diagnostic write'
+          status: '2/3 — SDK write queued locally. Firebase is sending it in the background…',
+          lastAction: 'Canonical SDK diagnostic write queued',
+          lastReadAt: Date.now(),
+          lastError: '',
+          extra: 'The POS will not wait for the server acknowledgement.'
         });
 
+        // Read from the local SDK cache immediately. This verifies the SDK accepted
+        // the write without pretending that local acceptance means cloud acknowledgement.
         const snap = await getDoc(diagnosticRef);
-        if (!snap.exists()) throw new Error('SDK write returned successfully but the diagnostic document could not be read back.');
+        if (!snap.exists()) throw new Error('SDK did not expose the queued diagnostic write in its local cache.');
 
         setCloudDiagnostic({
-          status: '3/3 — OPTIMIZED FIREBASE WRITE PASSED',
-          lastAction: 'SDK write + SDK read-back',
+          status: '3/3 — SDK WRITE QUEUED ✓ (server acknowledgement pending)',
+          lastAction: 'SDK local queue accepted',
           lastReadAt: Date.now(),
-          lastSyncAt: Date.now(),
-          writes: Number(cloudDiagnostics.writes || 0) + 1,
+          writes: Number(cloudDiagnostics.writes || 0),
           lastError: '',
-          extra: `Elapsed: ${((Date.now() - started) / 1000).toFixed(2)}s | Canonical state uses 1 document`
+          extra: `Queued in ${((Date.now() - started) / 1000).toFixed(2)}s. A later acknowledgement will be reported automatically.`
         });
-        toast('Optimized Firebase write passed.');
+        toast('Firebase write queued locally.');
+
+        writePromise.then(() => {
+          setCloudDiagnostic({
+            status: 'Firebase server acknowledgement received ✓',
+            lastAction: 'Diagnostic write acknowledged by Firebase',
+            lastSyncAt: Date.now(),
+            writes: Number(cloudDiagnostics.writes || 0) + 1,
+            lastError: '',
+            extra: `Server acknowledgement received after ${((Date.now() - started) / 1000).toFixed(1)}s.`
+          });
+        }).catch((error) => {
+          setCloudDiagnostic({
+            status: 'Firebase diagnostic write FAILED',
+            lastAction: 'Diagnostic server acknowledgement',
+            lastError: formatFirestoreError(error)
+          });
+        });
       } catch (e) {
         console.error('1911 optimized Firebase diagnostic failed:', e);
         setCloudDiagnostic({
