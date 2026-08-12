@@ -1700,7 +1700,6 @@ import {
   collection,
   getDocs,
   setDoc,
-  deleteDoc,
   writeBatch
 } from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js';
 
@@ -1723,9 +1722,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   const STORE_KEY = '1911CafePOS:v1';
   const $ = (id) => document.getElementById(id);
 
-  const AUTH_UID_PATH = '1911POS/{uid}';
-  const AUTH_PROFILE_COLLECTION = '1911POS';
-
   let sessionProfile = null;
   let authReady = false;
   let authBusy = false;
@@ -1733,12 +1729,35 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   let processedAuthUid = null;
   let rolloverTimer = null;
 
-  // Phase 3 cloud persistence state. Firebase Auth remains the access-control
-  // layer; Firestore persistence is scoped to the authenticated UID.
-  const CLOUD_COLLECTIONS = ['categories', 'products', 'inventory', 'tables', 'activeOrders', 'orders'];
+  // -------------------------------------------------------------------------
+  // Phase 3 cloud persistence
+  //
+  // Firestore is the canonical cross-device business-data source.
+  // localStorage remains the Phase 2 cache/fallback and migration source.
+  //
+  // Firestore structure:
+  //   1911POS/{uid}/categories/{category.id}
+  //   1911POS/{uid}/products/{product.id}
+  //   1911POS/{uid}/inventory/{inventory.id}
+  //   1911POS/{uid}/tables/{table.id}
+  //   1911POS/{uid}/orders/{order.id}
+  //   1911POS/{uid}/settings/main
+  //   1911POS/{uid}/staff/{staff.id}
+  //
+  // Active orders and completed history both live in the single `orders`
+  // collection. The in-memory Phase 2 model still keeps them split between
+  // state.activeOrders and state.orders, preserving the existing UI behavior.
+  //
+  // Writes always use stable document IDs. There is no array-position matching,
+  // no special-case physical table, and no migration subcollection.
+  // NO migration subcollection. Existing stable IDs are always the Firestore
+  // document IDs.
+  // -------------------------------------------------------------------------
+
+  const CLOUD_COLLECTIONS = ['categories', 'products', 'inventory', 'tables', 'orders', 'staff'];
   const CLOUD_ROOT_COLLECTION = '1911POS';
-  const CLOUD_META_DOC = 'migration';
   const CLOUD_SETTINGS_DOC = 'main';
+
   let cloudUserUid = null;
   let cloudReady = false;
   let cloudMigrationStatus = 'not-started';
@@ -1747,7 +1766,11 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   let cloudSyncInFlight = false;
   let cloudSyncDirty = false;
   let cloudLastBusinessHash = '';
-  const cloudKnownIds = Object.fromEntries(CLOUD_COLLECTIONS.map(name => [name, new Set()]));
+  let cloudBaselineSnapshot = null;
+
+  const cloudKnownIds = Object.fromEntries(
+    CLOUD_COLLECTIONS.map(name => [name, new Set()])
+  );
 
   const defaultState = () => ({
     settings: {
@@ -1895,6 +1918,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function saveState() {
+    stampChangedBusinessRecords();
     localStorage.setItem(STORE_KEY, JSON.stringify(state));
 
     if (
@@ -1906,37 +1930,14 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     }
   }
 
-  function safeClone(v) {
-    return JSON.parse(JSON.stringify(v));
-  }
-
-  // -------------------------------------------------------------------------
-  // Phase 3: Local business state <-> Firestore persistence
-  //
-  // Firestore is authoritative AFTER migration completes.
-  // localStorage remains the local cache/fallback and is never cleared.
-  //
-  // Stable IDs are the Firestore document IDs. There is no array-position
-  // matching and no local+cloud array concatenation.
-  //
-  // Staff PINs/authentication are intentionally NOT migrated.
-  // Product recipes are already embedded in product.recipe and travel with
-  // their product document.
-  // -------------------------------------------------------------------------
-
   function getCloudRootRef(uidValue = cloudUserUid) {
     if (!uidValue) return null;
     return doc(db, CLOUD_ROOT_COLLECTION, uidValue);
   }
 
-  function getCloudMetaRef(uidValue = cloudUserUid) {
-    const root = getCloudRootRef(uidValue);
-    return root ? doc(collection(root, 'meta'), CLOUD_META_DOC) : null;
-  }
-
   function getCloudSettingsRef(uidValue = cloudUserUid) {
     const root = getCloudRootRef(uidValue);
-    return root ? doc(collection(root, 'settings'), CLOUD_SETTINGS_DOC) : null;
+    return root ? doc(root, 'settings', CLOUD_SETTINGS_DOC) : null;
   }
 
   function getCloudCollectionRef(collectionName, uidValue = cloudUserUid) {
@@ -1944,17 +1945,8 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     return root ? collection(root, collectionName) : null;
   }
 
-  function extractBusinessState() {
-    return {
-      settings: safeClone(state.settings || {}),
-      orderSequence: Number(state.orderSequence || 0),
-      categories: safeClone(Array.isArray(state.categories) ? state.categories : []),
-      products: safeClone(Array.isArray(state.products) ? state.products : []),
-      inventory: safeClone(Array.isArray(state.inventory) ? state.inventory : []),
-      tables: safeClone(Array.isArray(state.tables) ? state.tables : []),
-      activeOrders: safeClone(Array.isArray(state.activeOrders) ? state.activeOrders : []),
-      orders: safeClone(Array.isArray(state.orders) ? state.orders : [])
-    };
+  function safeClone(v) {
+    return JSON.parse(JSON.stringify(v));
   }
 
   function stableStringify(value) {
@@ -1963,18 +1955,76 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
   }
 
+  function recordTimestamp(record) {
+    if (!record || typeof record !== 'object') return 0;
+    return Math.max(
+      Number(record.updatedAt || 0),
+      Number(record.modifiedAt || 0),
+      Number(record.lastClosedAt || 0),
+      Number(record.paidAt || 0),
+      Number(record.createdAt || 0)
+    );
+  }
+
+  function fingerprintRecord(record) {
+    if (!record || typeof record !== 'object') return '';
+    const copy = safeClone(record);
+    delete copy.updatedAt;
+    delete copy.modifiedAt;
+    return stableStringify(copy);
+  }
+
+  const localRecordFingerprints = Object.fromEntries(
+    CLOUD_COLLECTIONS.map(name => [name, new Map()])
+  );
+
+  function getAllOrderRecords(snapshot = state) {
+    const active = Array.isArray(snapshot.activeOrders) ? snapshot.activeOrders : [];
+    const history = Array.isArray(snapshot.orders) ? snapshot.orders : [];
+    const byId = new Map();
+
+    [...history, ...active].forEach((raw) => {
+      if (!raw) return;
+      const id = String(raw.id || '').trim();
+      if (!id) return;
+      const previous = byId.get(id);
+      if (!previous || recordTimestamp(raw) >= recordTimestamp(previous)) {
+        byId.set(id, safeClone(raw));
+      }
+    });
+
+    return [...byId.values()];
+  }
+
+  function getBusinessSnapshotWithRecords() {
+    return {
+      settings: safeClone(state.settings || {}),
+      orderSequence: Number(state.orderSequence || 0),
+      categories: safeClone(Array.isArray(state.categories) ? state.categories : []),
+      products: safeClone(Array.isArray(state.products) ? state.products : []),
+      inventory: safeClone(Array.isArray(state.inventory) ? state.inventory : []),
+      tables: safeClone(Array.isArray(state.tables) ? state.tables : []),
+      orders: getAllOrderRecords(state),
+      staff: safeClone(Array.isArray(state.staff) ? state.staff : [])
+    };
+  }
+
+  function extractBusinessState() {
+    return getBusinessSnapshotWithRecords();
+  }
+
   function getBusinessStateHash(snapshot = extractBusinessState()) {
     return stableStringify(snapshot);
   }
 
   function businessCounts(snapshot) {
     return {
-      categories: snapshot.categories.length,
-      products: snapshot.products.length,
-      inventory: snapshot.inventory.length,
-      tables: snapshot.tables.length,
-      activeOrders: snapshot.activeOrders.length,
-      orders: snapshot.orders.length
+      categories: Array.isArray(snapshot.categories) ? snapshot.categories.length : 0,
+      products: Array.isArray(snapshot.products) ? snapshot.products.length : 0,
+      inventory: Array.isArray(snapshot.inventory) ? snapshot.inventory.length : 0,
+      tables: Array.isArray(snapshot.tables) ? snapshot.tables.length : 0,
+      orders: Array.isArray(snapshot.orders) ? snapshot.orders.length : 0,
+      staff: Array.isArray(snapshot.staff) ? snapshot.staff.length : 0
     };
   }
 
@@ -1982,12 +2032,22 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     return CLOUD_COLLECTIONS.reduce((sum, key) => sum + Number(counts[key] || 0), 0);
   }
 
+  function cloudCountsFromCloudState(cloudState) {
+    return Object.fromEntries(
+      CLOUD_COLLECTIONS.map(collectionName => [
+        collectionName,
+        Array.isArray(cloudState[collectionName]) ? cloudState[collectionName].length : 0
+      ])
+    );
+  }
+
   function cloudStatusText() {
-    if (cloudMigrationStatus === 'completed') return 'Firestore connected · Migration complete';
+    if (cloudMigrationStatus === 'completed') {
+      return cloudStatusDetails || 'Firestore connected · Business data loaded';
+    }
     if (cloudMigrationStatus === 'in-progress') return 'Firestore migration in progress...';
-    if (cloudMigrationStatus === 'failed') return 'Firestore migration failed · Local data preserved';
-    if (cloudStatusDetails) return cloudStatusDetails;
-    return 'Firestore persistence is ready for the first migration.';
+    if (cloudMigrationStatus === 'failed') return cloudStatusDetails || 'Firestore error · Local data preserved';
+    return cloudStatusDetails || 'Firestore persistence is ready.';
   }
 
   function setCloudStatus(status, details = '') {
@@ -1995,56 +2055,204 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     cloudStatusDetails = details || '';
   }
 
-  async function readCloudBusinessState(uidValue = cloudUserUid) {
-    if (!uidValue) throw new Error('No authenticated Firebase UID is available.');
+  function normalizeCollectionRecords(records, collectionName) {
+    const byId = new Map();
 
-    const result = {
-      settings: null,
+    (Array.isArray(records) ? records : []).forEach((raw) => {
+      if (!raw || typeof raw !== 'object') return;
+      const id = String(raw.id || '').trim();
+      if (!id) return;
+
+      const candidate = safeClone(raw);
+      const previous = byId.get(id);
+
+      if (!previous) {
+        byId.set(id, candidate);
+        return;
+      }
+
+      // Same stable ID means same logical record. Keep the newer copy.
+      // When timestamps tie, the first record remains deterministic.
+      if (recordTimestamp(candidate) > recordTimestamp(previous)) {
+        byId.set(id, candidate);
+      }
+    });
+
+    return [...byId.values()];
+  }
+
+  function normalizeTablesForCloud(records) {
+    const byId = new Map();
+    (Array.isArray(records) ? records : []).forEach((raw) => {
+      if (!raw) return;
+      const id = String(raw.id || '').trim();
+      if (!id) return;
+
+      const candidate = safeClone(raw);
+      const previous = byId.get(id);
+      if (!previous || recordTimestamp(candidate) >= recordTimestamp(previous)) {
+        byId.set(id, candidate);
+      }
+    });
+
+    // Physical tables have a unique number/label. This prevents legacy
+    // duplicate physical-table records from becoming two rendered cards.
+    const byPhysicalKey = new Map();
+    for (const table of byId.values()) {
+      const physicalKey = Number.isFinite(Number(table.number))
+        ? `number:${Number(table.number)}`
+        : `label:${String(table.label || '').trim().toLowerCase()}`;
+
+      const previous = byPhysicalKey.get(physicalKey);
+      if (!previous) {
+        byPhysicalKey.set(physicalKey, table);
+        continue;
+      }
+
+      const winner = recordTimestamp(table) >= recordTimestamp(previous) ? table : previous;
+      const loser = winner === table ? previous : table;
+
+      if (loser.orderId && !winner.orderId) winner.orderId = loser.orderId;
+      if (Number(loser.lastClosedAt || 0) > Number(winner.lastClosedAt || 0)) {
+        winner.lastClosedAt = loser.lastClosedAt;
+      }
+
+      const mergedIds = new Set([
+        ...(Array.isArray(winner.mergedDuplicateIds) ? winner.mergedDuplicateIds : []),
+        String(loser.id)
+      ]);
+      winner.mergedDuplicateIds = [...mergedIds];
+      byPhysicalKey.set(physicalKey, winner);
+    }
+
+    return [...byPhysicalKey.values()].sort((a, b) => {
+      const an = Number(a.number);
+      const bn = Number(b.number);
+      if (Number.isFinite(an) && Number.isFinite(bn) && an !== bn) return an - bn;
+      return String(a.label || '').localeCompare(String(b.label || ''));
+    });
+  }
+
+  function normalizeOrdersForCloud(records) {
+    const byId = new Map();
+    (Array.isArray(records) ? records : []).forEach((raw) => {
+      if (!raw) return;
+      const id = String(raw.id || '').trim();
+      if (!id) return;
+      const candidate = normalizeOrder(safeClone(raw));
+      if (!candidate) return;
+      const previous = byId.get(id);
+      if (!previous || recordTimestamp(candidate) >= recordTimestamp(previous)) {
+        byId.set(id, candidate);
+      }
+    });
+
+    // There can only be one active order per physical table. When a legacy
+    // dataset contains two active orders for the same table with different IDs,
+    // keep the newest order and record the removed ID on the survivor.
+    const activeByTable = new Map();
+    for (const order of byId.values()) {
+      const isPaid = order.status === 'paid' || order.paymentStatus === 'paid';
+      if (isPaid || !order.tableId) continue;
+
+      const previous = activeByTable.get(order.tableId);
+      if (!previous) {
+        activeByTable.set(order.tableId, order);
+        continue;
+      }
+
+      const winner = recordTimestamp(order) >= recordTimestamp(previous) ? order : previous;
+      const loser = winner === order ? previous : order;
+      const mergedIds = new Set([
+        ...(Array.isArray(winner.mergedDuplicateIds) ? winner.mergedDuplicateIds : []),
+        String(loser.id)
+      ]);
+      winner.mergedDuplicateIds = [...mergedIds];
+      byId.set(winner.id, winner);
+      byId.delete(loser.id);
+      activeByTable.set(order.tableId, winner);
+    }
+
+    return [...byId.values()];
+  }
+
+  function buildCanonicalBusinessSnapshot(localSnapshot, cloudState) {
+    const local = localSnapshot || {};
+    const cloud = cloudState || {};
+
+    const canonical = {
+      settings: safeClone(local.settings || {}),
+      orderSequence: Math.max(
+        Number(local.orderSequence || 0),
+        Number(cloud.settings?.orderSequence || 0)
+      ),
       categories: [],
       products: [],
       inventory: [],
       tables: [],
-      activeOrders: [],
       orders: [],
-      migration: null,
-      cloudCounts: {}
+      staff: []
     };
 
-    const settingsRef = getCloudSettingsRef(uidValue);
-    const metaRef = getCloudMetaRef(uidValue);
+    const mergeCollection = (name) => {
+      const localRecords = normalizeCollectionRecords(local[name], name);
+      const cloudRecords = normalizeCollectionRecords(cloud[name], name);
+      const byId = new Map();
 
-    const settingsSnap = await getDoc(settingsRef);
-    const metaSnap = await getDoc(metaRef);
+      cloudRecords.forEach(record => byId.set(String(record.id), record));
 
-    if (settingsSnap.exists()) result.settings = settingsSnap.data() || {};
-    if (metaSnap.exists()) result.migration = metaSnap.data() || {};
+      localRecords.forEach(record => {
+        const id = String(record.id);
+        const cloudRecord = byId.get(id);
+        if (!cloudRecord) {
+          byId.set(id, record);
+          return;
+        }
 
-    for (const collectionName of CLOUD_COLLECTIONS) {
-      const collectionRef = getCloudCollectionRef(collectionName, uidValue);
-      const snap = await getDocs(collectionRef);
-      const records = [];
+        const localTime = recordTimestamp(record);
+        const cloudTime = recordTimestamp(cloudRecord);
 
-      snap.forEach(snapshot => {
-        const data = snapshot.data() || {};
-        records.push({
-          ...data,
-          id: data.id || snapshot.id
-        });
+        // Newer timestamp wins; tied records prefer local because the local
+        // browser is the explicit first-run migration source.
+        byId.set(id, localTime >= cloudTime ? record : cloudRecord);
       });
 
-      result[collectionName] = records;
-      result.cloudCounts[collectionName] = records.length;
+      return [...byId.values()];
+    };
 
-      cloudKnownIds[collectionName].clear();
-      records.forEach(record => {
-        if (record?.id) cloudKnownIds[collectionName].add(String(record.id));
-      });
+    canonical.categories = mergeCollection('categories');
+    canonical.products = mergeCollection('products');
+    canonical.inventory = mergeCollection('inventory');
+    canonical.staff = mergeCollection('staff');
+    canonical.tables = normalizeTablesForCloud(mergeCollection('tables'));
+
+    const mergedOrders = normalizeOrdersForCloud(
+      mergeCollection('orders')
+    );
+    canonical.orders = mergedOrders;
+
+    // Existing settings remain a single settings/main document. If the cloud
+    // document has a newer settings timestamp, keep its settings; otherwise
+    // preserve the local settings.
+    const cloudSettingsEnvelope = cloud.settings || {};
+    const localSettingsTime = Number(local.settings?.updatedAt || 0);
+    const cloudSettingsTime = Number(cloudSettingsEnvelope.updatedAt || 0);
+
+    if (cloudSettingsTime > localSettingsTime) {
+      canonical.settings = safeClone(
+        cloudSettingsEnvelope.settings || cloudSettingsEnvelope || {}
+      );
     }
 
-    return result;
+    canonical.orderSequence = Math.max(
+      canonical.orderSequence,
+      ...canonical.orders.map(o => Number(o.sequenceNo || 0))
+    );
+
+    return canonical;
   }
 
-  function applyCloudBusinessState(cloudState) {
+  function applyCanonicalBusinessSnapshot(snapshot) {
     const localUi = {
       currentStaffId: state.currentStaffId,
       activeCategoryId: state.activeCategoryId,
@@ -2063,62 +2271,234 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       adminCategorySearch: state.adminCategorySearch,
       checkoutDraft: state.checkoutDraft,
       showArchivedClosed: state.showArchivedClosed,
-      staff: state.staff
+      modalContext: state.modalContext,
+      activeTableFlowId: state.activeTableFlowId
     };
 
     const fallbackSettings = defaultState().settings;
-    const cloudSettingsEnvelope = cloudState.settings || {};
-    const cloudSettings = cloudSettingsEnvelope.settings || cloudSettingsEnvelope;
+    state.settings = {
+      ...fallbackSettings,
+      ...safeClone(snapshot.settings || {})
+    };
+    state.orderSequence = Number(snapshot.orderSequence || 0);
+    state.categories = safeClone(snapshot.categories || []);
+    state.products = safeClone(snapshot.products || []);
+    state.inventory = safeClone(snapshot.inventory || []);
+    state.tables = normalizeTablesForCloud(snapshot.tables || []);
+    state.staff = safeClone(snapshot.staff || []);
 
-    // Cloud business data replaces local business arrays. This is deliberately
-    // NOT a merge operation, so the same logical entity cannot be duplicated.
-    state.settings = { ...fallbackSettings, ...safeClone(cloudSettings || {}) };
-    state.categories = safeClone(cloudState.categories || []);
-    state.products = safeClone(cloudState.products || []);
-    state.inventory = safeClone(cloudState.inventory || []);
-    state.tables = safeClone(cloudState.tables || []);
-    state.activeOrders = safeClone(cloudState.activeOrders || []);
-    state.orders = safeClone(cloudState.orders || []);
-    state.orderSequence = Number(
-      cloudSettingsEnvelope.orderSequence ||
-      state.orderSequence ||
-      0
-    );
+    const allOrders = normalizeOrdersForCloud(snapshot.orders || []);
+    state.orders = allOrders.filter(o => o.status === 'paid' || o.paymentStatus === 'paid');
+    state.activeOrders = allOrders.filter(o => o.status !== 'paid' && o.paymentStatus !== 'paid');
 
     Object.assign(state, localUi);
 
-    // Keep the existing normalization/relationship repair logic in place, but
-    // never create default business records over a successfully loaded cloud
-    // collection.
-    migrateAndNormalize();
+    migrateAndNormalize({ cloudHydrated: true });
 
-    // A cloud order history is authoritative after migration. Do not restore
-    // a paid historical order into the UI selection.
-    if (state.currentOrderId) {
-      const current = getOrderById(state.currentOrderId);
-      if (!current || current.status === 'paid' || current.paymentStatus === 'paid') {
-        state.currentOrderId = null;
-      }
+    if (state.currentOrderId && !getOrderById(state.currentOrderId)) {
+      state.currentOrderId = null;
     }
 
+    const activeByTable = new Map();
+    state.activeOrders.forEach(order => {
+      if (!order.tableId) return;
+      const previous = activeByTable.get(order.tableId);
+      if (!previous || recordTimestamp(order) > recordTimestamp(previous)) {
+        activeByTable.set(order.tableId, order);
+      }
+    });
+
+    state.tables.forEach(table => {
+      if (!activeByTable.has(table.id)) {
+        table.orderId = null;
+      } else {
+        table.orderId = activeByTable.get(table.id).id;
+      }
+    });
+
+    state.activeOrders = state.activeOrders.filter(order => {
+      if (!order.tableId) return true;
+      return state.tables.some(table => table.id === order.tableId);
+    });
+
     cloudLastBusinessHash = getBusinessStateHash();
+    cloudBaselineSnapshot = safeClone(snapshot);
+
+    CLOUD_COLLECTIONS.forEach(name => {
+      const records = Array.isArray(snapshot[name]) ? snapshot[name] : [];
+      cloudKnownIds[name].clear();
+      records.forEach(record => {
+        if (record?.id) cloudKnownIds[name].add(String(record.id));
+      });
+    });
+
+    refreshLocalRecordFingerprints();
+  }
+
+  function refreshLocalRecordFingerprints() {
+    const snapshot = getBusinessSnapshotWithRecords();
+    const source = {
+      categories: snapshot.categories,
+      products: snapshot.products,
+      inventory: snapshot.inventory,
+      tables: snapshot.tables,
+      orders: snapshot.orders,
+      staff: snapshot.staff
+    };
+
+    CLOUD_COLLECTIONS.forEach(name => {
+      localRecordFingerprints[name].clear();
+      (source[name] || []).forEach(record => {
+        if (record?.id) {
+          localRecordFingerprints[name].set(String(record.id), fingerprintRecord(record));
+        }
+      });
+    });
+  }
+
+  function stampChangedBusinessRecords() {
+    const snapshot = getBusinessSnapshotWithRecords();
+    const source = {
+      categories: snapshot.categories,
+      products: snapshot.products,
+      inventory: snapshot.inventory,
+      tables: snapshot.tables,
+      orders: snapshot.orders,
+      staff: snapshot.staff
+    };
+
+    CLOUD_COLLECTIONS.forEach(name => {
+      const previousMap = localRecordFingerprints[name];
+      (source[name] || []).forEach(record => {
+        if (!record || !record.id) return;
+
+        const id = String(record.id);
+        const fp = fingerprintRecord(record);
+        const previous = previousMap.get(id);
+
+        if (!previous || previous !== fp) {
+          record.updatedAt = Date.now();
+          const target = getMutableStateRecordForCloudCollection(name, id);
+          if (target) target.updatedAt = record.updatedAt;
+        }
+      });
+    });
+
+    if (JSON.stringify(previousSettingsForStamping) !== JSON.stringify(state.settings || {})) {
+      state.settings.updatedAt = Date.now();
+    }
+
+    previousSettingsForStamping = safeClone(state.settings || {});
+    refreshLocalRecordFingerprints();
+  }
+
+  let previousSettingsForStamping = null;
+
+  function getStateRecordArrayForCloudCollection(name) {
+    if (name === 'categories') return state.categories || [];
+    if (name === 'products') return state.products || [];
+    if (name === 'inventory') return state.inventory || [];
+    if (name === 'tables') return state.tables || [];
+    if (name === 'staff') return state.staff || [];
+    if (name === 'orders') return getAllOrderRecords(state);
+    return [];
+  }
+
+  function getMutableStateRecordForCloudCollection(name, id) {
+    const sid = String(id || '');
+    if (!sid) return null;
+
+    if (name === 'orders') {
+      return (state.activeOrders || []).find(record => String(record.id) === sid)
+        || (state.orders || []).find(record => String(record.id) === sid)
+        || null;
+    }
+
+    return getStateRecordArrayForCloudCollection(name)
+      .find(record => String(record.id) === sid) || null;
+  }
+
+  async function readCloudBusinessState(uidValue = cloudUserUid) {
+    if (!uidValue) throw new Error('No authenticated Firebase UID is available.');
+
+    const result = {
+      settings: null,
+      categories: [],
+      products: [],
+      inventory: [],
+      tables: [],
+      orders: [],
+      staff: []
+    };
+
+    const settingsRef = getCloudSettingsRef(uidValue);
+    const settingsSnap = await getDoc(settingsRef);
+    if (settingsSnap.exists()) result.settings = settingsSnap.data() || {};
+
+    for (const collectionName of CLOUD_COLLECTIONS) {
+      const collectionRef = getCloudCollectionRef(collectionName, uidValue);
+      const snap = await getDocs(collectionRef);
+      const records = [];
+
+      snap.forEach(snapshot => {
+        const data = snapshot.data() || {};
+        records.push({
+          ...data,
+          id: data.id || snapshot.id
+        });
+      });
+
+      result[collectionName] =
+        collectionName === 'tables'
+          ? normalizeTablesForCloud(records)
+          : collectionName === 'orders'
+            ? normalizeOrdersForCloud(records)
+            : normalizeCollectionRecords(records, collectionName);
+
+      cloudKnownIds[collectionName].clear();
+      result[collectionName].forEach(record => {
+        if (record?.id) cloudKnownIds[collectionName].add(String(record.id));
+      });
+    }
+
+    return result;
+  }
+
+  async function readMigrationStatus(uidValue = cloudUserUid) {
+    if (!uidValue) return { exists: false, data: null };
+    const snap = await getDoc(getCloudSettingsRef(uidValue));
+    if (!snap.exists()) return { exists: false, data: null };
+
+    const data = snap.data() || {};
+    return {
+      exists: Boolean(data.migration),
+      data: data.migration || null
+    };
   }
 
   function makeCloudRecord(collectionName, record) {
     const cloned = safeClone(record || {});
     const id = String(cloned.id || '').trim();
-    if (!id) throw new Error(`Cannot migrate a ${collectionName} record without a stable ID.`);
+    if (!id) {
+      throw new Error(`Cannot persist a ${collectionName} record without a stable ID.`);
+    }
     return { id, data: cloned };
   }
 
-  async function writeRecordCollection(collectionName, records, options = {}) {
+  async function writeRecordCollection(collectionName, records, existingCloudRecords = []) {
     const uidValue = cloudUserUid;
     if (!uidValue) throw new Error('No authenticated Firebase UID is available.');
 
-    const currentRecords = Array.isArray(records) ? records : [];
-    const localIds = new Set();
+    const targetRecords = Array.isArray(records) ? records : [];
+    const targetIds = new Set(
+      targetRecords.map(record => String(record?.id || '').trim()).filter(Boolean)
+    );
+    const existingIds = new Set(
+      (Array.isArray(existingCloudRecords) ? existingCloudRecords : [])
+        .map(record => String(record?.id || '').trim())
+        .filter(Boolean)
+    );
 
-    // Firestore limits a batch to 500 writes. Keep a safety margin.
     let batch = writeBatch(db);
     let operations = 0;
 
@@ -2129,248 +2509,314 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       operations = 0;
     };
 
-    for (const rawRecord of currentRecords) {
+    for (const rawRecord of targetRecords) {
       const { id, data } = makeCloudRecord(collectionName, rawRecord);
-      localIds.add(id);
       const ref = doc(getCloudCollectionRef(collectionName, uidValue), id);
-      batch.set(ref, data, { merge: true });
+      batch.set(ref, data, { merge: false });
       operations++;
 
       if (operations >= 450) await commitBatch();
     }
 
-    // During the first migration, unmatched cloud-only records are preserved.
-    // After migration, loaded cloud IDs are considered part of the authoritative
-    // collection and local deletions are propagated by removing missing IDs.
-    if (options.reconcileDeletes) {
-      for (const existingId of cloudKnownIds[collectionName]) {
-        if (!localIds.has(existingId)) {
-          const ref = doc(getCloudCollectionRef(collectionName, uidValue), existingId);
-          batch.delete(ref);
-          operations++;
-          if (operations >= 450) await commitBatch();
-        }
+    // Reconcile only known existing IDs. This is safe after a fresh read of
+    // Firestore because the canonical snapshot was built from both sides.
+    for (const existingId of existingIds) {
+      if (!targetIds.has(existingId)) {
+        const ref = doc(getCloudCollectionRef(collectionName, uidValue), existingId);
+        batch.delete(ref);
+        operations++;
+
+        if (operations >= 450) await commitBatch();
       }
     }
 
     await commitBatch();
-
-    cloudKnownIds[collectionName].clear();
-    localIds.forEach(id => cloudKnownIds[collectionName].add(id));
   }
 
-  async function writeCloudBusinessState(snapshot, options = {}) {
+  async function writeCloudBusinessState(snapshot, existingCloudState = null) {
     if (!cloudUserUid) throw new Error('No authenticated Firebase UID is available.');
 
     const settingsRef = getCloudSettingsRef(cloudUserUid);
     await setDoc(settingsRef, {
       settings: safeClone(snapshot.settings || {}),
-      orderSequence: Number(snapshot.orderSequence || 0)
-    }, { merge: true });
+      orderSequence: Number(snapshot.orderSequence || 0),
+      updatedAt: Number(snapshot.settings?.updatedAt || Date.now())
+    }, { merge: false });
 
     for (const collectionName of CLOUD_COLLECTIONS) {
       await writeRecordCollection(
         collectionName,
         snapshot[collectionName],
-        { reconcileDeletes: Boolean(options.reconcileDeletes) }
+        existingCloudState?.[collectionName] || []
       );
+    }
+  }
+
+  function verifyRecordSet(expectedRecords, actualRecords, collectionName) {
+    const expected = normalizeCollectionRecords(expectedRecords, collectionName);
+    const actual = normalizeCollectionRecords(actualRecords, collectionName);
+
+    const expectedById = new Map(expected.map(record => [String(record.id), record]));
+    const actualById = new Map(actual.map(record => [String(record.id), record]));
+
+    if (expectedById.size !== actualById.size) {
+      throw new Error(
+        `Firestore verification failed for ${collectionName}: expected ${expectedById.size}, found ${actualById.size}.`
+      );
+    }
+
+    for (const [id, expectedRecord] of expectedById) {
+      const actualRecord = actualById.get(id);
+      if (!actualRecord) {
+        throw new Error(`Firestore verification failed: ${collectionName}/${id} is missing.`);
+      }
+
+      if (stableStringify(expectedRecord) !== stableStringify(actualRecord)) {
+        throw new Error(`Firestore verification failed: ${collectionName}/${id} does not match.`);
+      }
     }
   }
 
   async function verifyCloudBusinessState(snapshot, uidValue = cloudUserUid) {
     const cloud = await readCloudBusinessState(uidValue);
 
-    const expected = businessCounts(snapshot);
-    const actual = cloudCountsFromCloudState(cloud);
-
     for (const collectionName of CLOUD_COLLECTIONS) {
-      if (actual[collectionName] < expected[collectionName]) {
-        throw new Error(
-          `Migration verification failed for ${collectionName}: expected at least ${expected[collectionName]} records, found ${actual[collectionName]}.`
-        );
-      }
-
-      const expectedById = new Map(
-        (snapshot[collectionName] || []).map(record => [String(record.id), record])
+      verifyRecordSet(
+        snapshot[collectionName] || [],
+        cloud[collectionName] || [],
+        collectionName
       );
-      const actualById = new Map(
-        (cloud[collectionName] || []).map(record => [String(record.id), record])
-      );
-
-      for (const [id, expectedRecord] of expectedById) {
-        const actualRecord = actualById.get(id);
-        if (!actualRecord) {
-          throw new Error(`Migration verification failed: ${collectionName}/${id} was not found.`);
-        }
-
-        if (stableStringify(expectedRecord) !== stableStringify(actualRecord)) {
-          throw new Error(`Migration verification failed: ${collectionName}/${id} does not match the local source.`);
-        }
-      }
     }
 
-    const cloudSettingsEnvelope = cloud.settings || {};
-    const localSettingsEnvelope = {
-      settings: snapshot.settings,
+    const expectedSettings = {
+      settings: safeClone(snapshot.settings || {}),
       orderSequence: Number(snapshot.orderSequence || 0)
     };
+    const actualSettings = {
+      settings: safeClone(cloud.settings?.settings || {}),
+      orderSequence: Number(cloud.settings?.orderSequence || 0)
+    };
 
-    if (stableStringify(localSettingsEnvelope) !== stableStringify({
-      settings: cloudSettingsEnvelope.settings || {},
-      orderSequence: Number(cloudSettingsEnvelope.orderSequence || 0)
-    })) {
-      throw new Error('Migration verification failed for business settings.');
+    if (stableStringify(expectedSettings) !== stableStringify(actualSettings)) {
+      throw new Error('Firestore verification failed for business settings.');
     }
 
     return {
       cloud,
-      counts: actual
+      counts: cloudCountsFromCloudState(cloud)
     };
   }
 
-  function cloudCountsFromCloudState(cloudState) {
-    return Object.fromEntries(
-      CLOUD_COLLECTIONS.map(collectionName => [
-        collectionName,
-        Array.isArray(cloudState[collectionName]) ? cloudState[collectionName].length : 0
-      ])
-    );
+  function ensureAuthenticatedStaffLink(user) {
+    if (!user) return null;
+
+    let staff = null;
+    const exactUid = String(user.uid || '');
+
+    staff = state.staff.find(st => String(st.uid || '') === exactUid);
+    if (!staff && user.email) {
+      staff = state.staff.find(st =>
+        String(st.email || '').toLowerCase() === String(user.email).toLowerCase()
+      );
+    }
+    if (!staff) {
+      const owners = state.staff.filter(st =>
+        st.active !== false && String(st.role || '').toUpperCase() === 'OWNER'
+      );
+      if (owners.length === 1) staff = owners[0];
+    }
+
+    if (!staff) return null;
+
+    staff.uid = exactUid;
+    if (user.email) staff.email = user.email;
+    staff.active = staff.active !== false;
+    return staff;
   }
 
-  async function readMigrationStatus(uidValue = cloudUserUid) {
-    if (!uidValue) return { exists: false, data: null };
+  async function migrateLocalBusinessToFirestore(options = {}) {
+    const uidValue = String(auth.currentUser?.uid || '').trim();
+    if (!uidValue) {
+      toast('Please sign in before migrating the POS to Firestore.');
+      return false;
+    }
 
-    const metaRef = getCloudMetaRef(uidValue);
-    const snap = await getDoc(metaRef);
-    return {
-      exists: snap.exists(),
-      data: snap.exists() ? (snap.data() || {}) : null
-    };
-  }
+    if (!options.silent && !isOwner()) {
+      toast('Only the OWNER account can run the first Firestore migration.');
+      return false;
+    }
 
-  async function prepareCloudSession(uidValue) {
     cloudUserUid = uidValue;
     cloudReady = false;
-    setCloudStatus('not-started', 'Checking Firestore persistence...');
+    setCloudStatus(
+      'in-progress',
+      options.silent
+        ? 'Synchronizing Phase 2 data with Firestore...'
+        : 'Reading local POS data and checking Firestore...'
+    );
 
-    const migration = await readMigrationStatus(uidValue);
+    try {
+      const localSnapshot = extractBusinessState();
+      const before = await readCloudBusinessState(uidValue);
 
-    if (migration.exists && migration.data?.status === 'completed') {
-      const cloud = await readCloudBusinessState(uidValue);
-      applyCloudBusinessState(cloud);
+      // Merge both sides by stable ID. Same-ID conflicts use the newer
+      // timestamp; unrelated cloud records are preserved.
+      const canonical = buildCanonicalBusinessSnapshot(localSnapshot, before);
+
+      // The first write contains only canonical business data. Migration is NOT
+      // marked complete yet.
+      await writeCloudBusinessState(canonical, before);
+      const verification = await verifyCloudBusinessState(canonical, uidValue);
+
+      // Only after the actual Firestore documents verify do we mark migration
+      // completed in settings/main.
+      await setDoc(getCloudSettingsRef(uidValue), {
+        settings: safeClone(canonical.settings || {}),
+        orderSequence: Number(canonical.orderSequence || 0),
+        migration: {
+          status: 'completed',
+          schemaVersion: 3,
+          uid: uidValue,
+          completedAt: Date.now(),
+          counts: verification.counts
+        },
+        updatedAt: Number(canonical.settings?.updatedAt || Date.now())
+      }, { merge: false });
+
+      // Re-read from Firestore once more. This is the exact data fresh browsers
+      // will receive, and it makes the verified cloud state the local cache.
+      const finalCloud = await readCloudBusinessState(uidValue);
+      const finalSnapshot = {
+        settings: safeClone(finalCloud.settings?.settings || {}),
+        orderSequence: Number(finalCloud.settings?.orderSequence || 0),
+        categories: finalCloud.categories || [],
+        products: finalCloud.products || [],
+        inventory: finalCloud.inventory || [],
+        tables: finalCloud.tables || [],
+        orders: finalCloud.orders || [],
+        staff: finalCloud.staff || []
+      };
+
+      applyCanonicalBusinessSnapshot(finalSnapshot);
+
       setCloudStatus(
         'completed',
-        `Firestore connected · ${totalBusinessRecordCount(cloudCountsFromCloudState(cloud))} business records loaded`
+        `Firestore connected · ${totalBusinessRecordCount(cloudCountsFromCloudState(finalCloud))} business records verified`
       );
       cloudReady = true;
       cloudLastBusinessHash = getBusinessStateHash();
-      return;
-    }
+      cloudBaselineSnapshot = extractBusinessState();
 
-    // Migration has not completed. Keep localStorage as the source and inspect
-    // Firestore only enough to tell the owner whether pre-existing cloud data exists.
-    const cloud = await readCloudBusinessState(uidValue);
-    const cloudTotal = totalBusinessRecordCount(cloudCountsFromCloudState(cloud));
+      if (!options.silent) {
+        renderAll();
+        renderAdmin();
+        toast('POS data migrated to Firestore successfully.');
+      }
 
-    if (cloudTotal > 0) {
-      setCloudStatus(
-        'not-started',
-        `Firestore contains ${cloudTotal} existing records · review before migration`
-      );
-    } else {
-      setCloudStatus('not-started', 'Firestore is empty · local POS data is ready to migrate');
-    }
-  }
-
-  async function migrateLocalBusinessToFirestore() {
-    if (!auth.currentUser?.uid) {
-      toast('Please sign in before migrating the POS to Firestore.');
-      return;
-    }
-    if (!isOwner()) {
-      toast('Only the OWNER account can run the Firestore migration.');
-      return;
-    }
-
-    setCloudStatus('in-progress', 'Reading local POS data and checking Firestore...');
-    renderAdmin();
-
-    const uidValue = auth.currentUser.uid;
-    cloudUserUid = uidValue;
-    const localSnapshot = extractBusinessState();
-    const localCounts = businessCounts(localSnapshot);
-
-    try {
-      // Read existing cloud state before writing. Matching IDs are updated,
-      // not duplicated. Cloud-only records are preserved during the initial
-      // migration rather than silently destroyed.
-      const before = await readCloudBusinessState(uidValue);
-
-      await setDoc(getCloudMetaRef(uidValue), {
-        status: 'in-progress',
-        source: 'localStorage:1911CafePOS:v1',
-        startedAt: Date.now(),
-        uid: uidValue
-      }, { merge: true });
-
-      await writeCloudBusinessState(localSnapshot, { reconcileDeletes: false });
-
-      const verification = await verifyCloudBusinessState(localSnapshot, uidValue);
-
-      await setDoc(getCloudMetaRef(uidValue), {
-        status: 'completed',
-        source: 'localStorage:1911CafePOS:v1',
-        completedAt: Date.now(),
-        uid: uidValue,
-        localCounts,
-        cloudCountsBefore: before.cloudCounts,
-        cloudCountsAfter: verification.counts,
-        cloudOnlyRecordsPreserved:
-          Math.max(
-            0,
-            totalBusinessRecordCount(verification.counts) -
-            totalBusinessRecordCount(localCounts)
-          )
-      }, { merge: true });
-
-      cloudMigrationStatus = 'completed';
-      cloudStatusDetails = `Migration complete · ${totalBusinessRecordCount(localCounts)} local business records verified`;
-      cloudReady = true;
-      cloudLastBusinessHash = getBusinessStateHash(localSnapshot);
-
-      // After the controlled first migration, the authenticated user's cloud
-      // state becomes authoritative. LocalStorage remains intact as cache.
-      renderAll();
-      renderAdmin();
-      toast('POS data migrated to Firestore successfully.');
+      return true;
     } catch (error) {
       cloudReady = false;
-      setCloudStatus('failed', formatFirestoreError(error));
+      setCloudStatus('failed', 'Cloud migration/sync failed · local data preserved');
 
       try {
-        await setDoc(getCloudMetaRef(uidValue), {
-          status: 'failed',
-          failedAt: Date.now(),
-          error: String(error?.message || error)
+        const currentSettings = safeClone(state.settings || {});
+        await setDoc(getCloudSettingsRef(uidValue), {
+          settings: currentSettings,
+          orderSequence: Number(state.orderSequence || 0),
+          migration: {
+            status: 'failed',
+            schemaVersion: 3,
+            uid: uidValue,
+            failedAt: Date.now(),
+            error: String(error?.message || error)
+          },
+          updatedAt: Number(currentSettings.updatedAt || Date.now())
         }, { merge: true });
       } catch (_) {}
 
-      renderAdmin();
-      toast('Firestore migration failed. Local POS data was preserved.');
+      if (!options.silent) {
+        renderAdmin();
+        toast('Firestore migration failed. Local POS data was preserved.');
+      }
+      console.warn('1911 Firestore migration failed:', error);
+      return false;
     }
   }
 
+  async function hydrateFromFirestore(uidValue) {
+    const cloud = await readCloudBusinessState(uidValue);
+    const migration = cloud.settings?.migration || null;
+
+    const canonical = {
+      settings: safeClone(cloud.settings?.settings || cloud.settings || {}),
+      orderSequence: Number(cloud.settings?.orderSequence || 0),
+      categories: cloud.categories || [],
+      products: cloud.products || [],
+      inventory: cloud.inventory || [],
+      tables: cloud.tables || [],
+      orders: cloud.orders || [],
+      staff: cloud.staff || []
+    };
+
+    // A fresh browser must be able to hydrate even when localStorage is empty.
+    // Do not use the migration flag as the hydration condition.
+    applyCanonicalBusinessSnapshot(canonical);
+
+    setCloudStatus(
+      migration?.status === 'completed' ? 'completed' : 'not-started',
+      `Firestore connected · ${totalBusinessRecordCount(cloudCountsFromCloudState(cloud))} business records loaded`
+    );
+
+    cloudReady = true;
+    cloudLastBusinessHash = getBusinessStateHash();
+    cloudBaselineSnapshot = extractBusinessState();
+
+    return cloud;
+  }
+
+  async function prepareCloudSession(uidValue) {
+    cloudUserUid = String(uidValue || '').trim();
+    cloudReady = false;
+    setCloudStatus('not-started', 'Checking Firestore persistence...');
+
+    if (!cloudUserUid) {
+      throw new Error('No authenticated Firebase UID is available.');
+    }
+
+    const cloud = await readCloudBusinessState(cloudUserUid);
+    const migration = cloud.settings?.migration || null;
+    const cloudCount = totalBusinessRecordCount(cloudCountsFromCloudState(cloud));
+    const localSnapshot = extractBusinessState();
+    const localCount = totalBusinessRecordCount(businessCounts(localSnapshot));
+
+    if (migration?.status === 'completed') {
+      // IMPORTANT: hydration is unconditional after authentication.
+      // The original browser's localStorage is not required on fresh devices.
+      await hydrateFromFirestore(cloudUserUid);
+      return;
+    }
+
+    // First authenticated session (or a prior failed/incomplete migration):
+    // merge localStorage and any existing cloud data, verify the actual docs,
+    // mark completion only after verification, and then re-read Firestore.
+    setCloudStatus(
+      'in-progress',
+      cloudCount
+        ? `First-run migration: ${localCount} local + ${cloudCount} existing Firestore records`
+        : `First-run migration: ${localCount} local records`
+    );
+
+    const success = await migrateLocalBusinessToFirestore({ silent: true });
+    if (!success) {
+      cloudReady = false;
+      return;
+    }
+
+    await hydrateFromFirestore(cloudUserUid);
+  }
+
   async function syncBusinessStateToFirestore() {
-    if (
-      !cloudReady ||
-      !cloudUserUid ||
-      cloudMigrationStatus !== 'completed'
-    ) return;
-
-    const snapshot = extractBusinessState();
-    const hash = getBusinessStateHash(snapshot);
-
-    if (hash === cloudLastBusinessHash) return;
+    if (!cloudReady || !cloudUserUid || cloudMigrationStatus !== 'completed') return;
 
     if (cloudSyncInFlight) {
       cloudSyncDirty = true;
@@ -2381,24 +2827,139 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     cloudSyncDirty = false;
 
     try {
-      await writeCloudBusinessState(snapshot, { reconcileDeletes: true });
-      await verifyCloudBusinessState(snapshot, cloudUserUid);
+      const localSnapshot = extractBusinessState();
+      const cloud = await readCloudBusinessState(cloudUserUid);
 
-      cloudLastBusinessHash = getBusinessStateHash(snapshot);
+      // The current browser was already hydrated from Firestore. Use timestamps
+      // for same-ID conflicts and preserve cloud-only records instead of
+      // concatenating arrays blindly.
+      const merged = buildCanonicalBusinessSnapshot(localSnapshot, cloud);
+      merged.settings = {
+        ...safeClone(merged.settings || {}),
+        migration: cloud.settings?.migration || {
+          status: 'completed',
+          schemaVersion: 3,
+          uid: cloudUserUid
+        }
+      };
 
-      await setDoc(getCloudMetaRef(cloudUserUid), {
-        status: 'completed',
-        lastSyncAt: Date.now(),
-        lastSyncCounts: businessCounts(snapshot)
-      }, { merge: true });
+      // Preserve intentional local deletions for IDs that existed in this
+      // browser's baseline, but do not delete a record that another client
+      // changed after the baseline.
+      for (const collectionName of CLOUD_COLLECTIONS) {
+        const baseline = cloudBaselineSnapshot?.[collectionName] || [];
+        const localIds = new Set(
+          (localSnapshot[collectionName] || []).map(r => String(r?.id || '')).filter(Boolean)
+        );
+        const baselineById = new Map(
+          baseline.map(r => [String(r?.id || ''), r])
+        );
+        const currentCloud = cloud[collectionName] || [];
+
+        const protectedCloudOnly = new Map();
+        const deletedLocalIds = new Set();
+
+        currentCloud.forEach(record => {
+          const id = String(record?.id || '');
+          if (!id || localIds.has(id)) return;
+
+          const baselineRecord = baselineById.get(id);
+
+          // A record that appeared in Firestore after this browser's baseline is
+          // preserved as a legitimate cloud-only change.
+          if (!baselineRecord) {
+            protectedCloudOnly.set(id, record);
+            return;
+          }
+
+          // If the cloud record is unchanged since hydration, the local removal
+          // is intentional and the record may be deleted during this sync.
+          if (recordTimestamp(record) > recordTimestamp(baselineRecord)) {
+            protectedCloudOnly.set(id, record);
+          } else {
+            deletedLocalIds.add(id);
+          }
+        });
+
+        if (deletedLocalIds.size) {
+          if (collectionName === 'orders') {
+            merged.orders = (merged.orders || []).filter(
+              record => !deletedLocalIds.has(String(record?.id || ''))
+            );
+          } else if (collectionName === 'tables') {
+            merged.tables = (merged.tables || []).filter(
+              record => !deletedLocalIds.has(String(record?.id || ''))
+            );
+          } else {
+            merged[collectionName] = (merged[collectionName] || []).filter(
+              record => !deletedLocalIds.has(String(record?.id || ''))
+            );
+          }
+        }
+
+        if (collectionName === 'orders') {
+          const mergedById = new Map(
+            (merged.orders || []).map(r => [String(r.id), r])
+          );
+          protectedCloudOnly.forEach((record, id) => {
+            mergedById.set(id, record);
+          });
+          merged.orders = normalizeOrdersForCloud([...mergedById.values()]);
+        } else if (collectionName === 'tables') {
+          const mergedById = new Map(
+            (merged.tables || []).map(r => [String(r.id), r])
+          );
+          protectedCloudOnly.forEach((record, id) => {
+            mergedById.set(id, record);
+          });
+          merged.tables = normalizeTablesForCloud([...mergedById.values()]);
+        } else {
+          const mergedById = new Map(
+            (merged[collectionName] || []).map(r => [String(r.id), r])
+          );
+          protectedCloudOnly.forEach((record, id) => {
+            mergedById.set(id, record);
+          });
+          merged[collectionName] = [...mergedById.values()];
+        }
+      }
+
+      merged.orderSequence = Math.max(
+        Number(merged.orderSequence || 0),
+        ...merged.orders.map(o => Number(o.sequenceNo || 0))
+      );
+
+      await writeCloudBusinessState(merged, cloud);
+      const verified = await verifyCloudBusinessState(merged, cloudUserUid);
+
+      // The verified Firestore state becomes the new local/cache state. This
+      // also makes deleted entities disappear locally only after the cloud write
+      // succeeds.
+      const verifiedSnapshot = {
+        settings: safeClone(verified.cloud.settings?.settings || merged.settings || {}),
+        orderSequence: Number(verified.cloud.settings?.orderSequence || merged.orderSequence || 0),
+        categories: verified.cloud.categories || [],
+        products: verified.cloud.products || [],
+        inventory: verified.cloud.inventory || [],
+        tables: verified.cloud.tables || [],
+        orders: verified.cloud.orders || [],
+        staff: verified.cloud.staff || []
+      };
+
+      applyCanonicalBusinessSnapshot(verifiedSnapshot);
+      cloudLastBusinessHash = getBusinessStateHash();
+      cloudBaselineSnapshot = extractBusinessState();
+
+      setCloudStatus(
+        'completed',
+        `Firestore connected · ${totalBusinessRecordCount(verified.counts)} business records synchronized`
+      );
 
       if (state.adminTab === 'settings' && $('adminList') && $('adminEditor')) {
         renderSettingsAdmin($('adminList'), $('adminEditor'));
       }
     } catch (error) {
-      // Never claim success. Keep localStorage untouched and leave the next
-      // save eligible to retry.
-      setCloudStatus('failed', `Cloud sync failed · local data preserved`);
+      setCloudStatus('failed', 'Cloud sync failed · local data preserved');
       cloudSyncDirty = true;
       if (state.adminTab === 'settings' && $('adminList') && $('adminEditor')) {
         renderSettingsAdmin($('adminList'), $('adminEditor'));
@@ -2406,7 +2967,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       console.warn('1911 Firestore sync failed:', error);
     } finally {
       cloudSyncInFlight = false;
-
       if (cloudSyncDirty) {
         cloudSyncDirty = false;
         scheduleCloudSync();
@@ -2424,27 +2984,28 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
   function forceCloudSync() {
     if (!cloudReady) {
-      toast('Run the Firestore migration first.');
+      toast('Firestore is not connected yet.');
       return;
     }
+
     if (cloudSyncTimer) {
       clearTimeout(cloudSyncTimer);
       cloudSyncTimer = null;
     }
+
     syncBusinessStateToFirestore()
       .then(() => toast('Firestore sync complete.'))
       .catch(() => toast('Firestore sync failed. Local data was preserved.'));
   }
 
   async function refreshCloudBusinessFromFirestore() {
-    if (!cloudReady || !cloudUserUid) {
-      toast('Firestore persistence is not active yet.');
+    if (!cloudUserUid) {
+      toast('Firestore is not connected yet.');
       return;
     }
 
     try {
-      const cloud = await readCloudBusinessState(cloudUserUid);
-      applyCloudBusinessState(cloud);
+      await hydrateFromFirestore(cloudUserUid);
       saveState();
       renderAll();
       renderAdmin();
@@ -2465,32 +3026,44 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
           ? 'ERROR'
           : 'NOT STARTED';
 
-    const detail = cloudStatusDetails || 'Cloud persistence has not been migrated yet.';
+    const detail = cloudStatusDetails || 'Cloud persistence has not completed its first sync.';
     return `
       <div class="reportCard" style="grid-column:1/-1">
         <span class="statLabel">Firestore</span>
         <b>${escapeHtml(status)}</b>
         <div class="subtle" style="margin-top:6px">${escapeHtml(detail)}</div>
         <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:12px">
-          ${isOwner() ? `<button class="mini primary" type="button" onclick="window.__1911.migrateToFirestore()">Migrate to Firestore</button>` : ''}
-          ${cloudReady ? `<button class="mini ghost" type="button" onclick="window.__1911.syncFirestore()">Sync now</button>` : ''}
-          ${cloudReady ? `<button class="mini ghost" type="button" onclick="window.__1911.refreshFromFirestore()">Refresh from Firestore</button>` : ''}
+          ${isOwner()
+            ? `<button class="mini primary" type="button" onclick="window.__1911.migrateToFirestore()">Verify / Sync Phase 2 data</button>`
+            : ''}
+          ${cloudReady
+            ? `<button class="mini" type="button" onclick="window.__1911.refreshFromFirestore()">Refresh from Firestore</button>
+               <button class="mini" type="button" onclick="window.__1911.syncFirestore()">Sync now</button>`
+            : ''}
         </div>
-        <div class="subtle" style="margin-top:8px">Existing localStorage data remains intact. Migration uses stable record IDs and never appends cloud arrays to local arrays.</div>
       </div>
     `;
   }
 
-  function migrateAndNormalize() {
+  function migrateAndNormalize(options = {}) {
+    const cloudHydrated = Boolean(options.cloudHydrated);
     const d = defaultState();
+
     state.settings = { ...d.settings, ...(state.settings || {}) };
-    state.categories = normalizeArray(state.categories, d.categories);
-    state.inventory = normalizeArray(state.inventory, d.inventory);
-    state.products = normalizeArray(state.products, d.products);
-    state.tables = normalizeArray(state.tables, []);
+
+    // Empty arrays are only replaced by Phase 2 defaults on a local-only load.
+    // An empty Firestore collection is real data and must remain empty.
+    state.categories = normalizeArray(state.categories, cloudHydrated ? [] : d.categories);
+    state.inventory = normalizeArray(state.inventory, cloudHydrated ? [] : d.inventory);
+    state.products = normalizeArray(state.products, cloudHydrated ? [] : d.products);
+    state.staff = normalizeArray(state.staff, cloudHydrated ? [] : d.staff);
+    state.tables = normalizeTablesForCloud(
+      Array.isArray(state.tables) ? state.tables : (cloudHydrated ? [] : d.tables)
+    );
+
     state.orders = Array.isArray(state.orders) ? state.orders : [];
     state.activeOrders = Array.isArray(state.activeOrders) ? state.activeOrders : [];
-    state.staff = normalizeArray(state.staff, d.staff);
+
     state.currentStaffId = state.currentStaffId || null;
     state.activeCategoryId = state.activeCategoryId || 'all';
     state.currentOrderId = state.currentOrderId || null;
@@ -2509,6 +3082,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     state.checkoutDraft = state.checkoutDraft || null;
     state.showArchivedClosed = state.showArchivedClosed ?? true;
     state.orderSequence = Number(state.orderSequence || 0);
+
     if (!state.orderSequence) {
       const existingSeq = [...(state.orders || []), ...(state.activeOrders || [])]
         .map(o => Number(o?.sequenceNo) || getOrderSequenceFromCode(o?.code) || 0)
@@ -2516,20 +3090,15 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       state.orderSequence = existingSeq.length ? Math.max(...existingSeq) + 1 : 1;
     }
 
-    if (!state.tables.length) {
-      state.tables = Array.from({ length: Number(state.settings.tableCount) || 12 }, (_, i) => ({
-        id: uid('tbl'),
-        number: i + 1,
-        label: `Table ${String(i + 1).padStart(2, '0')}`,
-        orderId: null,
-        lastClosedAt: null
-      }));
-    }
+    // The table array itself is the source of truth. Never create or remove
+    // tables merely to match settings.tableCount and never renumber them.
+    state.tables = normalizeTablesForCloud(state.tables);
 
-    // assign missing category/product relations
     const catIds = new Set(state.categories.map(c => c.id));
     const firstCategory = state.categories[0]?.id || null;
+
     state.products = state.products.map((p, idx) => ({
+      ...p,
       id: p.id || uid('prd'),
       name: String(p.name || `Product ${idx + 1}`),
       price: Number(p.price || 0),
@@ -2541,46 +3110,36 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       recipe: Array.isArray(p.recipe) ? p.recipe : []
     }));
 
-    // attach product categories by id if missing
-    if (!catIds.size && state.products.length) {
-      state.categories = d.categories;
-    }
+    const allOrders = normalizeOrdersForCloud([
+      ...(state.orders || []),
+      ...(state.activeOrders || [])
+    ]);
 
-    // tables count sync
-    const desired = Math.max(1, Number(state.settings.tableCount) || 12);
-    if (state.tables.length < desired) {
-      const start = state.tables.length;
-      for (let i = start; i < desired; i++) {
-        state.tables.push({
-          id: uid('tbl'),
-          number: i + 1,
-          label: `Table ${String(i + 1).padStart(2, '0')}`,
-          orderId: null,
-          lastClosedAt: null
-        });
-      }
-    } else if (state.tables.length > desired) {
-      // preserve order, only trim if extra tables are completely empty
-      while (state.tables.length > desired) {
-        const last = state.tables[state.tables.length - 1];
-        if (last && !last.orderId) state.tables.pop();
-        else break;
-      }
-    }
+    state.orders = allOrders.filter(
+      o => o.status === 'paid' || o.paymentStatus === 'paid'
+    );
+    state.activeOrders = allOrders.filter(
+      o => o.status !== 'paid' && o.paymentStatus !== 'paid'
+    );
 
-    // normalize table labels/numbers
-    state.tables.forEach((t, i) => {
-      t.number = i + 1;
-      if (!t.label) t.label = `Table ${String(i + 1).padStart(2, '0')}`;
-      if (typeof t.orderId === 'undefined') t.orderId = null;
-      if (typeof t.lastClosedAt === 'undefined') t.lastClosedAt = null;
+    const activeByTable = new Map();
+    state.activeOrders.forEach(order => {
+      if (!order.tableId) return;
+      const previous = activeByTable.get(order.tableId);
+      if (!previous || recordTimestamp(order) > recordTimestamp(previous)) {
+        activeByTable.set(order.tableId, order);
+      }
     });
 
-    state.orders = (state.orders || []).map(normalizeOrder).filter(Boolean);
-    state.activeOrders = (state.activeOrders || []).map(normalizeOrder).filter(Boolean);
+    state.tables.forEach(table => {
+      const linkedOrder = activeByTable.get(table.id);
+      table.orderId = linkedOrder ? linkedOrder.id : null;
+      if (typeof table.lastClosedAt === 'undefined') table.lastClosedAt = null;
+    });
 
-    // ensure active order references are clean
-    state.activeOrders = state.activeOrders.filter(o => o && o.id && o.status !== 'paid');
+    state.activeOrders = state.activeOrders.filter(order =>
+      !order.tableId || state.tables.some(table => table.id === order.tableId)
+    );
     state.orders = state.orders.filter(o => o && o.id);
   }
 
@@ -3235,26 +3794,61 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
   async function loadStaffProfile(user) {
     try {
-      const staffRef = doc(db, AUTH_PROFILE_COLLECTION, user.uid);
-      const staffSnap = await getDoc(staffRef);
-      if (!staffSnap.exists()) {
-        throw Object.assign(new Error(`Firebase account authenticated, but no 1911POS staff profile was found. Requested document: ${AUTH_PROFILE_COLLECTION}/${user.uid}`), { code: 'auth/profile-not-found', uid: user.uid });
+      const staffCollectionRef = getCloudCollectionRef('staff', user.uid);
+      const staffSnap = await getDocs(staffCollectionRef);
+
+      const cloudStaff = [];
+      staffSnap.forEach(snapshot => {
+        const data = snapshot.data() || {};
+        cloudStaff.push({
+          ...data,
+          id: data.id || snapshot.id
+        });
+      });
+
+      let profile = cloudStaff.find(st => String(st.uid || '') === String(user.uid));
+
+      if (!profile && user.email) {
+        profile = cloudStaff.find(st =>
+          String(st.email || '').toLowerCase() === String(user.email).toLowerCase()
+        );
       }
-      const profile = staffSnap.data() || {};
-      const active = profile.active !== false;
-      if (!active) {
-        throw Object.assign(new Error(`Your 1911POS staff profile is inactive. Requested document: ${AUTH_PROFILE_COLLECTION}/${user.uid}`), { code: 'auth/profile-inactive', uid: user.uid });
+
+      // First-run fallback: link the existing Phase 2 staff record to the
+      // authenticated Firebase account before migration.
+      if (!profile) {
+        const localProfile = ensureAuthenticatedStaffLink(user);
+        if (localProfile) profile = localProfile;
       }
+
+      if (!profile) {
+        throw Object.assign(
+          new Error(`Firebase account authenticated, but no 1911POS staff record is linked to ${user.uid}.`),
+          { code: 'auth/profile-not-found', uid: user.uid }
+        );
+      }
+
+      if (profile.active === false) {
+        throw Object.assign(
+          new Error('Your 1911POS staff profile is inactive.'),
+          { code: 'auth/profile-inactive', uid: user.uid }
+        );
+      }
+
       return {
         uid: user.uid,
+        id: profile.id || null,
         email: profile.email || user.email || '',
         name: profile.name || user.displayName || 'Staff Member',
         role: String(profile.role || 'STAFF').toUpperCase(),
-        active
+        active: profile.active !== false
       };
     } catch (error) {
       if (String(error?.code || '').startsWith('auth/profile-')) throw error;
-      throw Object.assign(new Error(formatFirestoreError(error)), { code: error?.code || 'firestore/error', originalError: error });
+      throw Object.assign(
+        new Error(formatFirestoreError(error)),
+        { code: error?.code || 'firestore/error', originalError: error }
+      );
     }
   }
 
@@ -3269,14 +3863,29 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
     const profile = await loadStaffProfile(user);
 
-    // Authentication remains unchanged. Once the authenticated UID is known,
-    // Phase 3 loads the authoritative cloud business state only when a
-    // completed migration exists; otherwise localStorage remains the source.
+    const linkedStaff = ensureAuthenticatedStaffLink(user);
+    if (linkedStaff) {
+      linkedStaff.uid = uid;
+      linkedStaff.email = profile.email || user.email || linkedStaff.email || '';
+    }
+
+    state.currentStaffId =
+      state.staff.find(
+        st => st.id === profile.id ||
+              (st.name === profile.name && (st.role || '').toUpperCase() === profile.role)
+      )?.id ||
+      state.currentStaffId ||
+      state.staff[0]?.id ||
+      null;
+
     try {
+      // Authentication establishes the UID; Firestore is ALWAYS read after
+      // authentication. The migration status never controls fresh-browser
+      // hydration.
       await prepareCloudSession(uid);
     } catch (cloudError) {
       cloudReady = false;
-      setCloudStatus('failed', `Cloud read failed · local data preserved`);
+      setCloudStatus('failed', 'Cloud read failed · local data preserved');
       console.warn('1911 Firestore session load failed:', cloudError);
     }
 
@@ -3284,14 +3893,17 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     processedAuthUid = uid;
     authReady = true;
 
-    state.currentStaffId =
-      state.staff.find(
-        st => st.name === profile.name &&
-              (st.role || '').toUpperCase() === profile.role
-      )?.id ||
-      state.currentStaffId ||
-      state.staff[0]?.id ||
-      null;
+    const hydratedStaff =
+      state.staff.find(st => String(st.uid || '') === uid) ||
+      state.staff.find(st =>
+        profile.email &&
+        String(st.email || '').toLowerCase() === String(profile.email).toLowerCase()
+      ) ||
+      state.staff.find(st => st.id === profile.id);
+
+    if (hydratedStaff) {
+      state.currentStaffId = hydratedStaff.id;
+    }
 
     saveState();
     setAuthStateView('ready', `Signed in as ${profile.name}.`, '', false);
@@ -4691,7 +5303,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       <div class="adminForm">
         <div class="field">
           <div class="formLabel">Table name</div>
-          <input class="input" id="t_label" value="${escapeAttr(t?.label || `Table ${String(state.tables.length + 1).padStart(2, '0')}`)}" />
+          <input class="input" id="t_label" value="${escapeAttr(t?.label || `Table ${String((state.tables.reduce((max, table) => Math.max(max, Number(table.number) || 0), 0) + 1)).padStart(2, '0')}`)}" />
         </div>
         <button class="mini primary" type="button" onclick="window.__1911.saveTable()">Save table</button>
         ${t ? `<button class="mini danger" type="button" onclick="window.__1911.deleteTable('${t.id}')">Delete table</button>` : ''}
@@ -4717,9 +5329,14 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       const t = getTableById(state.adminSelection);
       if (t) t.label = label;
     } else {
+      const nextNumber = state.tables.reduce(
+        (max, table) => Math.max(max, Number(table.number) || 0),
+        0
+      ) + 1;
+
       state.tables.push({
         id: uid('tbl'),
-        number: state.tables.length + 1,
+        number: nextNumber,
         label,
         orderId: null,
         lastClosedAt: null
