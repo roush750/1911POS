@@ -1693,7 +1693,7 @@
 <script type="module">
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js';
 import { getAuth, setPersistence, browserLocalPersistence, onAuthStateChanged, signInWithEmailAndPassword, signOut } from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js';
-import { getFirestore, doc, getDoc, getDocs, collection, setDoc, writeBatch } from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js';
+import { initializeFirestore, doc, getDoc, getDocs, collection, setDoc, writeBatch } from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js';
 
 const firebaseConfig = {
   apiKey: "AIzaSyB_m-lt22FJ7fShyRHDgPEbkYTSOzMpMYM",
@@ -1707,7 +1707,7 @@ const firebaseConfig = {
 
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
-const db = getFirestore(app);
+const db = initializeFirestore(app, { experimentalForceLongPolling: true, useFetchStreams: false });
 setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Firebase persistence setup failed:', err));
 
 (() => {
@@ -1831,7 +1831,15 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
         setCloudDiagnostic({ status: 'Writing one diagnostic document…', lastAction: `Manual Firebase test write (${uid})` });
         const ref = doc(db, '1911POS', uid, '_diagnostics', 'connection');
         const payload = { ok: true, uid: String(uid), testedAt: Date.now(), source: '1911POS Phase 3 diagnostic' };
-        await setDoc(ref, payload, { merge: true });
+        // Never leave the diagnostic hanging forever. If Firestore cannot complete
+        // the network write, report that explicitly so we can distinguish a
+        // transport problem from a POS synchronization problem.
+        const timeout = new Promise((_, reject) => setTimeout(() => {
+          const e = new Error('Firestore write timed out after 10 seconds. The browser reached the write call, but Firebase did not complete it.');
+          e.code = 'firestore/write-timeout';
+          reject(e);
+        }, 10000));
+        await Promise.race([setDoc(ref, payload, { merge: true }), timeout]);
         setCloudDiagnostic({ status: 'Write succeeded — reading it back…' });
         const snap = await getDoc(ref);
         if (!snap.exists()) throw new Error('Firebase write returned but the test document could not be read back.');
