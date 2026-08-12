@@ -1825,45 +1825,55 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     panel.querySelector('[data-cloud-debug="test"]').addEventListener('click', async (event) => {
       event.preventDefault();
       event.stopPropagation();
-      setCloudDiagnostic({ status: 'TEST CLICKED — contacting Firebase…', lastAction: 'Manual Firebase test write', lastError: '' });
+      setCloudDiagnostic({
+        status: '1/3 — Testing optimized REST write…',
+        lastAction: 'Canonical REST diagnostic write',
+        lastError: ''
+      });
       try {
         const uid = sessionProfile?.uid || auth.currentUser?.uid;
         if (!uid) throw new Error('No authenticated Firebase UID.');
-        const testStartedAt = Date.now();
-        const ref = doc(db, '1911POS', uid, '_diagnostics', 'connection');
-        const payload = { ok: true, uid: String(uid), testedAt: Date.now(), source: '1911POS Phase 3 diagnostic' };
 
-        setCloudDiagnostic({ status: '1/5 — Testing SDK read…', lastAction: 'Full Firebase diagnostic', lastError: '' });
-        const preRead = await getDoc(ref);
+        const started = Date.now();
+        const diagnosticName = `projects/${firebaseConfig.projectId}/databases/(default)/documents/1911POS/${encodeURIComponent(String(uid))}/_diagnostics/optimizedWrite`;
+        const fields = firestoreRestFields({
+          ok: true,
+          uid: String(uid),
+          testedAt: Date.now(),
+          source: '1911POS Phase 3 optimized REST diagnostic'
+        });
 
-        const timeout = (label, ms = 10000) => new Promise((_, reject) => setTimeout(() => {
-          const e = new Error(`${label} timed out after ${ms / 1000} seconds.`);
-          e.code = 'firestore/diagnostic-timeout';
-          reject(e);
-        }, ms));
+        await writeRestDocument(String(uid), diagnosticName, fields, { timeoutMs: 15000 });
 
-        setCloudDiagnostic({ status: '2/5 — SDK read succeeded. Testing SDK setDoc write…', lastAction: 'Full Firebase diagnostic' });
-        await Promise.race([setDoc(ref, payload, { merge: true }), timeout('Firestore SDK setDoc write')]);
+        setCloudDiagnostic({
+          status: '2/3 — REST write succeeded. Reading it back…',
+          lastAction: 'Canonical REST diagnostic write'
+        });
 
-        setCloudDiagnostic({ status: '3/5 — SDK write succeeded. Reading it back…', lastAction: 'Full Firebase diagnostic' });
-        const snap = await Promise.race([getDoc(ref), timeout('Firestore SDK read-back')]);
-        if (!snap.exists()) throw new Error('SDK write returned but the diagnostic document could not be read back.');
+        const snap = await getDoc(doc(db, '1911POS', String(uid), '_diagnostics', 'optimizedWrite'));
+        if (!snap.exists()) throw new Error('REST write returned successfully but the diagnostic document could not be read back.');
 
-        setCloudDiagnostic({ status: '4/5 — SDK READ + WRITE passed. Testing direct Firestore REST write…', lastAction: 'Full Firebase diagnostic' });
-        const restUrl = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(firebaseConfig.projectId)}/databases/(default)/documents/1911POS/${encodeURIComponent(uid)}/_diagnostics/restConnection`;
-        const restBody = { fields: { ok: { booleanValue: true }, uid: { stringValue: String(uid) }, testedAt: { integerValue: String(Date.now()) }, source: { stringValue: '1911POS Phase 3 REST diagnostic' } } };
-        const restResponse = await Promise.race([fetch(restUrl, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(restBody), cache: 'no-store' }), timeout('Direct Firestore REST write')]);
-        const restText = await restResponse.text();
-        if (!restResponse.ok) { const e = new Error(`Direct Firestore REST write failed (${restResponse.status}): ${restText.slice(0, 500)}`); e.code = 'firestore/rest-write-failed'; throw e; }
-
-        setCloudDiagnostic({ status: '5/5 — ALL FIREBASE TESTS PASSED', lastAction: 'Full Firebase diagnostic', lastReadAt: Date.now(), lastSyncAt: Date.now(), writes: Number(cloudDiagnostics.writes || 0) + 2, lastError: '', extra: `Elapsed: ${((Date.now() - testStartedAt) / 1000).toFixed(2)}s | SDK pre-read: ${preRead.exists() ? 'exists' : 'missing'} | REST: HTTP ${restResponse.status}` });
-        toast('All Firebase diagnostics passed.');
+        setCloudDiagnostic({
+          status: '3/3 — OPTIMIZED FIREBASE WRITE PASSED',
+          lastAction: 'REST write + SDK read-back',
+          lastReadAt: Date.now(),
+          lastSyncAt: Date.now(),
+          writes: Number(cloudDiagnostics.writes || 0) + 1,
+          lastError: '',
+          extra: `Elapsed: ${((Date.now() - started) / 1000).toFixed(2)}s | Canonical state uses 1 document`
+        });
+        toast('Optimized Firebase write passed.');
       } catch (e) {
-        console.error('1911 Firebase diagnostic test failed:', e);
-        setCloudDiagnostic({ status: 'FIREBASE TEST FAILED', lastAction: 'Manual Firebase test write', lastError: formatFirestoreError(e) });
-        toast('Firebase test failed — check diagnostic panel.');
+        console.error('1911 optimized Firebase diagnostic failed:', e);
+        setCloudDiagnostic({
+          status: 'FIREBASE WRITE TEST FAILED',
+          lastAction: 'Canonical REST diagnostic write',
+          lastError: formatFirestoreError(e)
+        });
+        toast('Firebase write test failed — check diagnostic panel.');
       }
     }, { passive: false });
+
     window.test1911FirebaseWrite = async () => {
       const button = panel.querySelector('[data-cloud-debug="test"]');
       button?.click();
@@ -2035,7 +2045,20 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     }
   }
 
+  // ============================================================
+  // 1911 Phase 3 — Optimized cloud persistence
+  // Canonical state lives in ONE Firestore document:
+  // 1911POS/{uid}/state/main
+  // This dramatically reduces reads/writes and avoids the large
+  // multi-collection batch that was causing write failures.
+  // ============================================================
+
   const CLOUD_COLLECTIONS = ['categories', 'products', 'inventory', 'orders', 'tables', 'staff'];
+  const CANONICAL_STATE_COLLECTION = 'state';
+  const CANONICAL_STATE_ID = 'main';
+
+  let lastCloudPayloadSignature = '';
+  let cloudNeedsCanonicalWrite = false;
 
   function cloudNamespace(uid) {
     return ['1911POS', String(uid)];
@@ -2059,6 +2082,15 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   function cloudMigrationRef(uid) {
     const [root, userId] = cloudNamespace(uid);
     return doc(db, root, userId, 'meta', 'migration');
+  }
+
+  function canonicalStateRef(uid) {
+    return doc(db, '1911POS', String(uid), CANONICAL_STATE_COLLECTION, CANONICAL_STATE_ID);
+  }
+
+  function canonicalStateRestName(uid) {
+    const encode = (v) => encodeURIComponent(String(v));
+    return `projects/${firebaseConfig.projectId}/databases/(default)/documents/1911POS/${encode(uid)}/${encode(CANONICAL_STATE_COLLECTION)}/${encode(CANONICAL_STATE_ID)}`;
   }
 
   function cloudRecordKey(name, record) {
@@ -2089,9 +2121,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
         result.push(record);
         continue;
       }
-      // Merge only genuinely duplicated logical records. Prefer the record
-      // that currently carries a live order reference; otherwise preserve the
-      // first record so existing IDs remain stable for this Phase 2 -> Phase 3 transition.
       const existing = result[existingIndex];
       if (name === 'tables') {
         if (!existing.orderId && record.orderId) existing.orderId = record.orderId;
@@ -2146,236 +2175,288 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     };
   }
 
-  async function readCloudBusinessState(uid) {
-    const results = await Promise.all([
-      ...CLOUD_COLLECTIONS.map(name => getDocs(cloudCollectionRef(uid, name))),
-      getDoc(cloudSettingsRef(uid))
-    ]);
-    const cloud = { categories: [], products: [], inventory: [], orders: [], tables: [], staff: [], settings: null };
-    CLOUD_COLLECTIONS.forEach((name, index) => {
-      const raw = results[index].docs.map(snap => ({ id: snap.id, ...snap.data() }));
-      cloud[name] = dedupeRecords(raw, name);
-    });
-    const settingsSnap = results[CLOUD_COLLECTIONS.length];
-    cloud.settings = settingsSnap.exists() ? (settingsSnap.data() || {}) : null;
-    const hasBusinessRecords = CLOUD_COLLECTIONS.some(name => cloud[name].length > 0) || Boolean(cloud.settings);
-    return { ...cloud, hasBusinessRecords };
+  function cloudPayloadSignature(business) {
+    try {
+      return JSON.stringify(business);
+    } catch (_) {
+      return '';
+    }
   }
 
-  function mergeRecordsPreservingLocal(localRecords, cloudRecords, name) {
-    const merged = new Map();
-    // Cloud first, then local. When a Phase 2 record and a cloud record are
-    // logically the same item but have different IDs, the local record wins.
-    for (const record of dedupeRecords(cloudRecords, name)) {
-      const key = cloudRecordKey(name, record);
-      if (key) merged.set(key, safeClone(record));
-    }
-    for (const record of dedupeRecords(localRecords, name)) {
-      const key = cloudRecordKey(name, record);
-      if (key) merged.set(key, safeClone(record));
-    }
-    return [...merged.values()];
-  }
-
-  function applyCloudBusinessState(cloud) {
+  function applyCanonicalCloudState(payload) {
     const d = defaultState();
-    const useLocalRecords = localStateWasPresent;
-    state.settings = cloud.settings
-      ? { ...d.settings, ...(cloud.settings.settings || cloud.settings), ...(useLocalRecords ? state.settings : {}) }
-      : state.settings;
-    state.categories = useLocalRecords ? mergeRecordsPreservingLocal(state.categories, cloud.categories, 'categories') : dedupeRecords(cloud.categories, 'categories');
-    state.products = useLocalRecords ? mergeRecordsPreservingLocal(state.products, cloud.products, 'products') : dedupeRecords(cloud.products, 'products');
-    state.inventory = useLocalRecords ? mergeRecordsPreservingLocal(state.inventory, cloud.inventory, 'inventory') : dedupeRecords(cloud.inventory, 'inventory');
-    state.tables = useLocalRecords ? mergeRecordsPreservingLocal(state.tables, cloud.tables, 'tables') : dedupeRecords(cloud.tables, 'tables');
-    state.staff = useLocalRecords ? mergeRecordsPreservingLocal(state.staff, cloud.staff, 'staff') : dedupeRecords(cloud.staff, 'staff');
+    const business = payload && typeof payload === 'object' ? payload : {};
+    state.settings = { ...d.settings, ...(business.settings || {}) };
+    state.categories = dedupeRecords(business.categories || [], 'categories');
+    state.products = dedupeRecords(business.products || [], 'products');
+    state.inventory = dedupeRecords(business.inventory || [], 'inventory');
+    state.tables = dedupeRecords(business.tables || [], 'tables');
+    state.staff = dedupeRecords(business.staff || [], 'staff');
 
-    const cloudOrders = dedupeRecords(cloud.orders || [], 'orders');
-    const localOrders = useLocalRecords ? dedupeRecords([...(state.orders || []), ...(state.activeOrders || [])], 'orders') : [];
-    const allOrders = useLocalRecords ? mergeRecordsPreservingLocal(localOrders, cloudOrders, 'orders') : cloudOrders;
+    const allOrders = dedupeRecords(business.orders || [], 'orders');
     state.activeOrders = allOrders.filter(order => order && order.status !== 'paid' && order.paymentStatus !== 'paid');
     state.orders = allOrders.filter(order => order && (order.status === 'paid' || order.paymentStatus === 'paid'));
 
-    const localOrderSequence = Number(state.orderSequence || 0);
-    const cloudOrderSequence = Number(cloud.settings?.orderSequence || 0);
-    state.orderSequence = Math.max(localOrderSequence, cloudOrderSequence, 1);
+    state.orderSequence = Math.max(Number(business.orderSequence || 0), 1);
     state.currentOrderId = null;
     state.adminSelection = null;
     dedupeStateInMemory();
     ensureCurrentStaff();
   }
 
-  function firestoreRestValue(value) {
-    if (value === null || value === undefined) return { nullValue: null };
-    if (typeof value === 'boolean') return { booleanValue: value };
-    if (typeof value === 'number') {
-      if (!Number.isFinite(value)) return { nullValue: null };
-      return Number.isInteger(value) ? { integerValue: String(value) } : { doubleValue: value };
-    }
-    if (typeof value === 'string') return { stringValue: value };
-    if (Array.isArray(value)) return { arrayValue: { values: value.map(firestoreRestValue) } };
-    if (typeof value === 'object') {
-      const fields = {};
-      Object.entries(value).forEach(([k, v]) => { fields[k] = firestoreRestValue(v); });
-      return { mapValue: { fields } };
-    }
-    return { stringValue: String(value) };
-  }
-
-  function firestoreRestFields(record) {
-    const fields = {};
-    Object.entries(record || {}).forEach(([key, value]) => {
-      if (key === '__name__') return;
-      fields[key] = firestoreRestValue(value);
-    });
-    return fields;
-  }
-
-  function firestoreRestDocumentName(uid, collectionName, documentId) {
-    const encode = (v) => encodeURIComponent(String(v));
-    return `projects/${firebaseConfig.projectId}/databases/(default)/documents/1911POS/${encode(uid)}/${encode(collectionName)}/${encode(documentId)}`;
-  }
-
-  async function firestoreRestCommit(uid, writes) {
-    if (!writes.length) return;
-    const user = auth.currentUser;
-    if (!user || user.uid !== String(uid)) throw new Error('No authenticated Firebase user for Firestore REST write.');
-    const idToken = await user.getIdToken(true);
-    const endpoint = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/(default)/documents:commit`;
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${idToken}`
-      },
-      body: JSON.stringify({ writes })
-    });
-    const text = await response.text();
-    let payload = null;
-    try { payload = text ? JSON.parse(text) : null; } catch (_) {}
-    if (!response.ok) {
-      const message = payload?.error?.message || text || `HTTP ${response.status}`;
-      const error = new Error(`Firestore REST write failed: ${message}`);
-      error.code = `firestore/rest-${response.status}`;
-      throw error;
-    }
-    return payload;
-  }
-
-  async function writeCloudBusinessState(uid, source = 'localStorage') {
-    const business = businessStateForCloud();
-    setCloudDiagnostic({ uid: String(uid), status: 'Uploading to Firebase…', lastAction: `Cloud write (${source})`, source, mode: source, lastError: '' });
-    const desiredByCollection = Object.fromEntries(CLOUD_COLLECTIONS.map(name => [name, new Map()]));
-    const writes = [];
-    for (const name of CLOUD_COLLECTIONS) {
-      for (const record of business[name]) {
-        if (!record?.id) continue;
-        desiredByCollection[name].set(String(record.id), record);
-        writes.push({ update: { name: firestoreRestDocumentName(uid, name, record.id), fields: firestoreRestFields(record) } });
-      }
-    }
-
-    // Read existing documents with the SDK, but perform all writes through the
-    // authenticated Firestore REST commit endpoint. This bypasses the Web SDK
-    // write transport that was hanging on this browser/network while leaving
-    // the existing Firestore rules and data model unchanged.
-    const existingSnapshots = await Promise.all(
-      CLOUD_COLLECTIONS.map(name => getDocs(cloudCollectionRef(uid, name)))
-    );
-
-    const deleteWrites = [];
+  async function readLegacyCloudBusinessState(uid) {
+    const results = await Promise.all([
+      ...CLOUD_COLLECTIONS.map(name => getDocs(cloudCollectionRef(uid, name))),
+      getDoc(cloudSettingsRef(uid))
+    ]);
+    const cloud = {
+      categories: [],
+      products: [],
+      inventory: [],
+      orders: [],
+      tables: [],
+      staff: [],
+      settings: null,
+      canonical: false,
+      hasBusinessRecords: false
+    };
     CLOUD_COLLECTIONS.forEach((name, index) => {
-      existingSnapshots[index].docs.forEach(snap => {
-        if (!desiredByCollection[name].has(String(snap.id))) {
-          deleteWrites.push({ delete: firestoreRestDocumentName(uid, name, snap.id) });
-        }
-      });
+      const raw = results[index].docs.map(snap => ({ id: snap.id, ...snap.data() }));
+      cloud[name] = dedupeRecords(raw, name);
     });
+    const settingsSnap = results[CLOUD_COLLECTIONS.length];
+    cloud.settings = settingsSnap.exists() ? (settingsSnap.data() || {}) : null;
+    cloud.hasBusinessRecords = CLOUD_COLLECTIONS.some(name => cloud[name].length > 0) || Boolean(cloud.settings);
+    return cloud;
+  }
 
-    const allWrites = [...writes, ...deleteWrites];
-    const chunkSize = 400;
-    let committed = 0;
-    for (let i = 0; i < allWrites.length; i += chunkSize) {
-      const chunk = allWrites.slice(i, i + chunkSize);
-      setCloudDiagnostic({ uid: String(uid), status: `Uploading to Firebase… ${Math.min(i + chunk.length, allWrites.length)}/${allWrites.length}`, lastAction: 'Firestore REST commit', source, mode: source, lastError: '' });
-      await firestoreRestCommit(uid, chunk);
-      committed += chunk.length;
+  async function readCloudBusinessState(uid) {
+    // Fast path: one Firestore read for the entire POS state.
+    const canonicalSnap = await getDoc(canonicalStateRef(uid));
+    if (canonicalSnap.exists()) {
+      const payload = canonicalSnap.data() || {};
+      const business = payload.businessState || payload;
+      const cloud = {
+        categories: dedupeRecords(business.categories || [], 'categories'),
+        products: dedupeRecords(business.products || [], 'products'),
+        inventory: dedupeRecords(business.inventory || [], 'inventory'),
+        orders: dedupeRecords(business.orders || [], 'orders'),
+        tables: dedupeRecords(business.tables || [], 'tables'),
+        staff: dedupeRecords(business.staff || [], 'staff'),
+        settings: business.settings || {},
+        orderSequence: Number(business.orderSequence || 1),
+        canonical: true,
+        hasBusinessRecords: true
+      };
+      return cloud;
     }
 
-    // Settings/migration metadata are also written through the same REST path.
-    const metadataWrites = [
-      {
-        update: {
-          name: `projects/${firebaseConfig.projectId}/databases/(default)/documents/1911POS/${encodeURIComponent(String(uid))}/settings/main`,
-          fields: firestoreRestFields({ settings: business.settings, orderSequence: business.orderSequence, updatedAt: Date.now() })
-        }
-      },
-      {
-        update: {
-          name: `projects/${firebaseConfig.projectId}/databases/(default)/documents/1911POS/${encodeURIComponent(String(uid))}/meta/migration`,
-          fields: firestoreRestFields({ status: 'completed', informationalOnly: true, source, migratedAt: Date.now(), counts: Object.fromEntries(CLOUD_COLLECTIONS.map(name => [name, business[name].length])) })
-        }
-      }
-    ];
-    await firestoreRestCommit(uid, metadataWrites);
+    // One-time legacy migration path only. After the canonical document exists,
+    // this expensive multi-collection read is never used again.
+    return readLegacyCloudBusinessState(uid);
+  }
 
-    const counts = Object.fromEntries(CLOUD_COLLECTIONS.map(name => [name, business[name].length]));
-    const existingCount = existingSnapshots.reduce((sum, snap) => sum + snap.size, 0);
-    const desiredCount = writes.length;
-    const deletedCount = deleteWrites.length;
+  async function writeRestDocument(uid, documentName, fields, options = {}) {
+    const user = auth.currentUser;
+    if (!user || user.uid !== String(uid)) {
+      const e = new Error('No authenticated Firebase user for Firestore REST write.');
+      e.code = 'firestore/rest-auth';
+      throw e;
+    }
+
+    const idToken = await user.getIdToken(true);
+    const endpoint = `https://firestore.googleapis.com/v1/${documentName}`;
+    const controller = new AbortController();
+    const timeoutMs = Number(options.timeoutMs || 15000);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const response = await fetch(endpoint, {
+        method: options.method || 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${idToken}`
+        },
+        body: JSON.stringify({ fields }),
+        cache: 'no-store',
+        signal: controller.signal
+      });
+      const text = await response.text();
+      let payload = null;
+      try { payload = text ? JSON.parse(text) : null; } catch (_) {}
+
+      if (!response.ok) {
+        const message = payload?.error?.message || text || `HTTP ${response.status}`;
+        const e = new Error(`Firestore REST write failed: ${message}`);
+        e.code = `firestore/rest-${response.status}`;
+        e.httpStatus = response.status;
+        throw e;
+      }
+      return payload;
+    } catch (error) {
+      if (error?.name === 'AbortError') {
+        const e = new Error(`Firestore REST write timed out after ${timeoutMs / 1000} seconds.`);
+        e.code = 'firestore/rest-timeout';
+        throw e;
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function writeCanonicalStateOnce(uid, business) {
+    const payload = {
+      version: 1,
+      savedAt: Date.now(),
+      businessState: business
+    };
+    return writeRestDocument(uid, canonicalStateRestName(uid), firestoreRestFields(payload), { timeoutMs: 15000 });
+  }
+
+  async function writeCanonicalStateWithRetry(uid, business) {
+    let lastError = null;
+    const delays = [0, 2000, 5000];
+    for (let attempt = 0; attempt < delays.length; attempt++) {
+      if (delays[attempt]) await new Promise(resolve => setTimeout(resolve, delays[attempt]));
+      try {
+        return await writeCanonicalStateOnce(uid, business);
+      } catch (error) {
+        lastError = error;
+        const retryable = ['firestore/rest-429', 'firestore/rest-500', 'firestore/rest-502', 'firestore/rest-503', 'firestore/rest-504', 'firestore/rest-timeout'].includes(String(error?.code || ''));
+        if (!retryable || attempt === delays.length - 1) throw error;
+      }
+    }
+    throw lastError || new Error('Firestore REST write failed.');
+  }
+
+  async function writeCloudBusinessState(uid, source = 'localStorage', force = false) {
+    const business = businessStateForCloud();
+    const signature = cloudPayloadSignature(business);
+
+    if (!force && !cloudNeedsCanonicalWrite && signature && signature === lastCloudPayloadSignature) {
+      setCloudDiagnostic({
+        uid: String(uid),
+        status: 'Cloud sync skipped — no business data changed',
+        lastAction: 'Cloud write deduplicated',
+        counts: {
+          categories: business.categories.length, products: business.products.length, inventory: business.inventory.length,
+          orders: business.orders.length, tables: business.tables.length, staff: business.staff.length
+        },
+        source,
+        mode: source,
+        lastError: ''
+      });
+      return { skipped: true };
+    }
+
+    setCloudDiagnostic({
+      uid: String(uid),
+      status: 'Uploading optimized POS state to Firebase…',
+      lastAction: `Cloud write (${source})`,
+      source,
+      mode: source,
+      counts: {
+        categories: business.categories.length, products: business.products.length, inventory: business.inventory.length,
+        orders: business.orders.length, tables: business.tables.length, staff: business.staff.length
+      },
+      lastError: ''
+    });
+
+    await writeCanonicalStateWithRetry(uid, business);
+
+    lastCloudPayloadSignature = signature;
+    cloudNeedsCanonicalWrite = false;
+
+    const counts = {
+      categories: business.categories.length, products: business.products.length, inventory: business.inventory.length,
+      orders: business.orders.length, tables: business.tables.length, staff: business.staff.length
+    };
+
     setCloudDiagnostic({
       uid: String(uid),
       status: 'Firebase upload successful',
-      lastAction: `Cloud write (${source}) via Firestore REST`,
+      lastAction: `Cloud write (${source}) → 1 document`,
       lastSyncAt: Date.now(),
       counts,
-      writes: desiredCount,
-      deletes: deletedCount,
+      writes: 1,
+      deletes: 0,
       source,
       mode: source,
+      extra: 'Canonical cloud document: 1911POS/{uid}/state/main',
       lastError: ''
     });
+
+    return { skipped: false };
   }
 
-  function scheduleCloudPersistence() {
+  function scheduleCloudPersistence(force = false) {
     if (!cloudPersistenceEnabled || cloudHydrationInProgress || !sessionProfile?.uid) return;
     cloudSyncPending = true;
+    if (force) cloudNeedsCanonicalWrite = true;
     clearTimeout(cloudSyncTimer);
-    cloudSyncTimer = setTimeout(() => { persistCurrentStateToCloud().catch((error) => console.warn('Firestore persistence failed:', error?.code || error?.message || error)); }, 350);
+    cloudSyncTimer = setTimeout(() => {
+      persistCurrentStateToCloud(force).catch((error) => {
+        console.warn('Firestore persistence failed:', error?.code || error?.message || error);
+      });
+    }, 500);
   }
 
   async function persistCurrentStateToCloud(force = false) {
     if ((!cloudPersistenceEnabled && !force) || cloudHydrationInProgress || !sessionProfile?.uid) {
-      setCloudDiagnostic({ status: 'Cloud sync skipped', lastAction: 'Sync requested but cloud persistence is disabled', uid: sessionProfile?.uid || '' });
-      return;
+      return { skipped: true };
     }
+
     if (cloudSyncInFlight) {
       cloudSyncPending = true;
-      return;
+      return { pending: true };
     }
+
     cloudSyncInFlight = true;
     cloudSyncPending = false;
+
     try {
-      await writeCloudBusinessState(sessionProfile.uid, localStateWasPresent ? 'localStorage' : 'application');
+      const result = await writeCloudBusinessState(
+        sessionProfile.uid,
+        localStateWasPresent ? 'localStorage' : 'application',
+        force
+      );
       localStateWasPresent = true;
+      return result;
     } catch (error) {
       const formatted = formatFirestoreError(error);
-      setCloudDiagnostic({ status: 'Firebase upload FAILED', lastAction: 'Cloud write', lastError: formatted });
+      setCloudDiagnostic({
+        uid: String(sessionProfile.uid),
+        status: 'Firebase upload FAILED',
+        lastAction: 'Cloud write',
+        lastError: formatted,
+        source: localStateWasPresent ? 'localStorage' : 'application',
+        mode: localStateWasPresent ? 'localStorage' : 'application'
+      });
       console.warn('Firestore persistence failed:', error?.code || error?.message || error);
-      // Do not create an endless retry loop on a permissions/network error.
-      // The next real state change will schedule another sync attempt.
-      cloudSyncPending = false;
+      return { failed: true, error };
     } finally {
       cloudSyncInFlight = false;
-      if (cloudSyncPending) scheduleCloudPersistence();
+      if (cloudSyncPending) {
+        cloudSyncPending = false;
+        scheduleCloudPersistence(false);
+      }
     }
   }
 
   async function hydrateOrMigrateCloudState(uid) {
     cloudHydrationInProgress = true;
     cloudPersistenceEnabled = false;
-    setCloudDiagnostic({ uid: String(uid), status: 'Reading Firebase on login…', lastAction: 'Startup cloud read', lastError: '' });
+    setCloudDiagnostic({
+      uid: String(uid),
+      status: 'Reading Firebase on login…',
+      lastAction: 'Startup cloud read',
+      lastError: ''
+    });
+
     try {
       const cloud = await readCloudBusinessState(uid);
+
       setCloudDiagnostic({
         uid: String(uid),
         lastReadAt: Date.now(),
@@ -2385,49 +2466,104 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
         },
         lastError: ''
       });
-      if (cloud.hasBusinessRecords) {
-        applyCloudBusinessState(cloud);
-        dedupeStateInMemory();
-        try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch (e) {}
+
+      if (cloud.canonical) {
+        applyCanonicalCloudState({
+          categories: cloud.categories,
+          products: cloud.products,
+          inventory: cloud.inventory,
+          orders: cloud.orders,
+          tables: cloud.tables,
+          staff: cloud.staff,
+          settings: cloud.settings,
+          orderSequence: cloud.orderSequence
+        });
+
+        lastCloudPayloadSignature = cloudPayloadSignature(businessStateForCloud());
+        cloudNeedsCanonicalWrite = false;
         cloudPersistenceEnabled = true;
-        // Do NOT block authentication on the cleanup upload. The cloud read
-        // is the important login step; duplicate/stale document cleanup runs
-        // in the background so a slow Firestore write cannot leave the POS
-        // stuck on “Verifying staff profile…”.
-        scheduleCloudPersistence();
+        localStateWasPresent = true;
+
+        try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch (_) {}
+
         setCloudDiagnostic({
           uid: String(uid),
-          status: 'Firebase read complete — login can continue',
-          lastAction: 'Cloud read complete; cleanup scheduled in background',
-          lastError: ''
+          status: 'Firebase state loaded',
+          lastAction: 'Canonical cloud read complete — 1 document',
+          lastError: '',
+          counts: {
+            categories: state.categories.length, products: state.products.length, inventory: state.inventory.length,
+            orders: state.orders.length, tables: state.tables.length, staff: state.staff.length
+          },
+          extra: 'Phase 3 canonical state is active.'
         });
-        return { mode: 'hydrated', hasBusinessRecords: true };
+
+        return { mode: 'hydrated', hasBusinessRecords: true, canonical: true };
       }
 
-      if (localStateWasPresent) {
+      if (cloud.hasBusinessRecords) {
+        // Legacy data exists. Merge it with the local Phase 2 state once,
+        // dedupe it, then migrate the cleaned result into the canonical doc.
+        applyLegacyCloudBusinessState(cloud);
         dedupeStateInMemory();
+        cloudNeedsCanonicalWrite = true;
+        lastCloudPayloadSignature = '';
         cloudPersistenceEnabled = true;
-        // First-time migration is also backgrounded. The POS can open while
-        // Firebase receives the Phase 2 local state.
-        scheduleCloudPersistence();
+        localStateWasPresent = true;
+        try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch (_) {}
+
+        scheduleCloudPersistence(true);
+
         setCloudDiagnostic({
           uid: String(uid),
-          status: 'No cloud business data — local data upload scheduled',
-          lastAction: 'Local Phase 2 state queued for Firebase',
-          lastError: ''
+          status: 'Legacy Firebase data loaded — migration queued',
+          lastAction: 'Legacy multi-collection read complete',
+          lastError: '',
+          counts: {
+            categories: state.categories.length, products: state.products.length, inventory: state.inventory.length,
+            orders: state.orders.length, tables: state.tables.length, staff: state.staff.length
+          },
+          extra: 'The cleaned POS state will be migrated into 1911POS/{uid}/state/main using one write.'
         });
+
+        return { mode: 'legacy-migration', hasBusinessRecords: true, canonical: false };
+      }
+
+      // No cloud business data yet.
+      if (localStateWasPresent) {
+        dedupeStateInMemory();
+        cloudNeedsCanonicalWrite = true;
+        lastCloudPayloadSignature = '';
+        cloudPersistenceEnabled = true;
+        scheduleCloudPersistence(true);
+
+        setCloudDiagnostic({
+          uid: String(uid),
+          status: 'No cloud data — local POS upload queued',
+          lastAction: 'Local Phase 2 migration',
+          lastError: '',
+          counts: {
+            categories: state.categories.length, products: state.products.length, inventory: state.inventory.length,
+            orders: state.orders.length, tables: state.tables.length, staff: state.staff.length
+          },
+          extra: 'Migration uses one canonical Firestore document.'
+        });
+
         return { mode: 'migrated', hasBusinessRecords: false };
       }
 
-      dedupeStateInMemory();
+      cloudNeedsCanonicalWrite = true;
+      lastCloudPayloadSignature = '';
       cloudPersistenceEnabled = true;
-      scheduleCloudPersistence();
+      scheduleCloudPersistence(true);
+
       setCloudDiagnostic({
         uid: String(uid),
-        status: 'New Firebase account — default data upload scheduled',
-        lastAction: 'Default POS state queued for Firebase',
+        status: 'Fresh POS — initial cloud state queued',
+        lastAction: 'Default state migration',
         lastError: ''
       });
+
       return { mode: 'initialized', hasBusinessRecords: false };
     } finally {
       cloudHydrationInProgress = false;
