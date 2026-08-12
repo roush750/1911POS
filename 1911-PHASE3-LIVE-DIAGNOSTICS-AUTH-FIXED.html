@@ -1,0 +1,645 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>1911 Phase 3 — Live Data Diagnostics</title>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#111;color:#eee;margin:0;padding:20px}
+.wrap{max-width:1400px;margin:auto}
+h1,h2,h3{margin:.3em 0}.sub{color:#aaa}
+.card{background:#1b1b1b;border:1px solid #333;border-radius:10px;padding:16px;margin:14px 0}
+button{background:#d4af37;color:#111;border:0;border-radius:7px;padding:10px 14px;font-weight:700;margin:4px;cursor:pointer}
+button.secondary{background:#333;color:#eee}
+button:disabled{opacity:.5;cursor:not-allowed}
+.status{white-space:pre-wrap;background:#090909;border:1px solid #333;padding:12px;border-radius:8px}
+table{width:100%;border-collapse:collapse;font-size:13px}th,td{border:1px solid #333;padding:7px;vertical-align:top;text-align:left}th{background:#222}
+.ok{color:#7ee787}.bad{color:#ff7b72}.warn{color:#f2cc60}
+pre{white-space:pre-wrap;word-break:break-word;max-height:420px;overflow:auto;background:#090909;padding:10px;border-radius:7px}
+.small{font-size:12px;color:#aaa}.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+.diff{background:#332b12}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>1911 Phase 3 — LIVE DATA DIAGNOSTICS</h1>
+<div class="sub">READ-ONLY. This page does not migrate, merge, repair, delete, write, or modify POS/Firestore business data.</div>
+
+<div class="card">
+<h2>Firebase Authentication</h2>
+<div id="auth">Initializing Firebase Authentication…</div>
+<div id="uid" class="small"></div>
+<div id="authDetails" class="small"></div>
+<button id="refresh" disabled>Refresh diagnostics</button>
+<button id="openPos" class="secondary">Open POS</button>
+</div>
+
+<div class="card">
+<h2>LocalStorage vs Firestore</h2>
+<div id="counts"></div>
+</div>
+
+<div class="card">
+<h2>Record-by-record comparison</h2>
+<div id="records"></div>
+</div>
+
+<div class="card">
+<h2>Table diagnostics</h2>
+<div id="tables"></div>
+</div>
+
+<div class="card">
+<h2>Product diagnostics</h2>
+<div id="products"></div>
+</div>
+
+<div class="card">
+<h2>Order diagnostics</h2>
+<div id="orders"></div>
+</div>
+
+<div class="card">
+<h2>Settings / migration metadata</h2>
+<div id="metadata"></div>
+</div>
+
+<div class="card">
+<h2>Raw diagnostic snapshot</h2>
+<pre id="raw"></pre>
+</div>
+</div>
+
+<script type="module">
+import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js';
+import {
+  getAuth,
+  setPersistence,
+  browserLocalPersistence,
+  onAuthStateChanged
+} from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js';
+import {
+  getFirestore,
+  collection,
+  doc,
+  getDocs,
+  getDoc
+} from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js';
+
+const firebaseConfig = {
+  apiKey: "AIzaSyB_m-lt22FJ7fShyRHDgPEbkYTSOzMPMyM",
+  authDomain: "menu-e4cef.firebaseapp.com",
+  projectId: "menu-e4cef",
+  storageBucket: "menu-e4cef.firebasestorage.app",
+  messagingSenderId: "686608343620",
+  appId: "1:686608343620:web:cbcf3c2c4e149caaee9211",
+  measurementId: "G-RDY676HQLB"
+};
+
+const STORE_KEY = '1911CafePOS:v1';
+const COLLECTIONS = ['categories','products','inventory','orders','tables','staff'];
+
+const $ = id => document.getElementById(id);
+const clone = value => value == null ? value : JSON.parse(JSON.stringify(value));
+const pretty = value => JSON.stringify(value, null, 2);
+const safe = value => value == null ? '' : String(value);
+
+let app;
+let auth;
+let db;
+let currentUser = null;
+let authResolved = false;
+let authError = null;
+let lastSnapshot = null;
+let refreshInFlight = false;
+let unsubscribeAuth = null;
+
+function setAuth(message, cls='') {
+  $('auth').innerHTML = cls ? `<span class="${cls}">${message}</span>` : message;
+}
+
+function showRuntimeError(stage, error) {
+  const code = safe(error?.code || 'unknown');
+  const message = safe(error?.message || error || 'Unknown error');
+  authError = { stage, code, message };
+  setAuth(`${stage} failed: ${code} — ${message}`, 'bad');
+  $('authDetails').textContent =
+    `JavaScript/runtime error captured. Stage: ${stage}. Code: ${code}. Message: ${message}`;
+  $('raw').textContent = pretty({ error: authError, at: new Date().toISOString() });
+  console.error('[1911 diagnostics]', stage, error);
+}
+
+function pathFor(uid, name) {
+  return `1911POS/${uid}/${name}`;
+}
+
+function collectionRef(uid, name) {
+  return collection(db, '1911POS', uid, name);
+}
+
+function settingsRef(uid) {
+  return doc(db, '1911POS', uid, 'settings', 'main');
+}
+
+function migrationRef(uid) {
+  return doc(db, '1911POS', uid, 'meta', 'migration');
+}
+
+function readLocal() {
+  const raw = localStorage.getItem(STORE_KEY);
+  if (raw == null) return { present:false, state:null, error:null };
+  try {
+    return { present:true, state:JSON.parse(raw), error:null };
+  } catch (error) {
+    return { present:true, state:null, error:String(error?.message || error) };
+  }
+}
+
+function normalizeLocal(state) {
+  return {
+    categories: Array.isArray(state?.categories) ? state.categories : [],
+    products: Array.isArray(state?.products) ? state.products : [],
+    inventory: Array.isArray(state?.inventory) ? state.inventory : [],
+    tables: Array.isArray(state?.tables) ? state.tables : [],
+    staff: Array.isArray(state?.staff) ? state.staff : [],
+    orders: [
+      ...(Array.isArray(state?.orders) ? state.orders : []),
+      ...(Array.isArray(state?.activeOrders) ? state.activeOrders : [])
+    ],
+    settings: state?.settings || null
+  };
+}
+
+function comparable(record) {
+  if (!record) return null;
+  const copy = clone(record);
+  delete copy.__docId;
+  delete copy.__source;
+  return copy;
+}
+
+function equalRecords(a,b) {
+  return JSON.stringify(comparable(a)) === JSON.stringify(comparable(b));
+}
+
+function equivalentRecords(name, record, all) {
+  if (!record) return [];
+  const candidates = all.filter(x => x && x.id && x.id !== record.id);
+
+  if (name === 'products') {
+    return candidates.filter(x =>
+      x.name === record.name &&
+      Number(x.price) === Number(record.price) &&
+      x.categoryId === record.categoryId &&
+      x.description === record.description
+    );
+  }
+
+  if (name === 'categories') {
+    return candidates.filter(x =>
+      x.name === record.name &&
+      Number(x.order) === Number(record.order) &&
+      x.active === record.active
+    );
+  }
+
+  if (name === 'inventory') {
+    return candidates.filter(x =>
+      x.name === record.name &&
+      x.unit === record.unit &&
+      Number(x.qty) === Number(record.qty) &&
+      Number(x.threshold) === Number(record.threshold)
+    );
+  }
+
+  if (name === 'tables') {
+    return candidates.filter(x =>
+      Number(x.number) === Number(record.number) &&
+      x.label === record.label
+    );
+  }
+
+  if (name === 'orders') {
+    return candidates.filter(x =>
+      x.tableId === record.tableId &&
+      Number(x.total) === Number(record.total) &&
+      x.status === record.status &&
+      x.paymentStatus === record.paymentStatus &&
+      JSON.stringify(x.items || []) === JSON.stringify(record.items || [])
+    );
+  }
+
+  if (name === 'staff') {
+    return candidates.filter(x =>
+      x.name === record.name &&
+      x.email === record.email &&
+      x.role === record.role
+    );
+  }
+
+  return [];
+}
+
+function duplicateIdCount(records) {
+  const counts = new Map();
+  for (const r of records) {
+    const id = r?.id;
+    if (id) counts.set(id, (counts.get(id) || 0) + 1);
+  }
+  return [...counts.values()].filter(n => n > 1).reduce((a,b) => a+b, 0);
+}
+
+async function readCloud(uid) {
+  const result = {
+    categories:[], products:[], inventory:[], orders:[], tables:[], staff:[],
+    settings:null, migration:null, hasBusinessRecords:false
+  };
+
+  for (const name of COLLECTIONS) {
+    const snap = await getDocs(collectionRef(uid, name));
+    result[name] = snap.docs.map(s => ({
+      id:s.id,
+      __docId:s.id,
+      ...s.data()
+    }));
+  }
+
+  const settingsSnap = await getDoc(settingsRef(uid));
+  if (settingsSnap.exists()) {
+    result.settings = { id:settingsSnap.id, __docId:settingsSnap.id, ...settingsSnap.data() };
+  }
+
+  const migrationSnap = await getDoc(migrationRef(uid));
+  if (migrationSnap.exists()) {
+    result.migration = { id:migrationSnap.id, __docId:migrationSnap.id, ...migrationSnap.data() };
+  }
+
+  result.hasBusinessRecords =
+    COLLECTIONS.some(name => result[name].length > 0) ||
+    Boolean(result.settings);
+
+  return result;
+}
+
+function renderCounts(local, cloud) {
+  const rows = COLLECTIONS.map(name => {
+    const l = local[name] || [];
+    const c = cloud[name] || [];
+    const localIds = new Set(l.map(x => x?.id).filter(Boolean));
+    const cloudIds = new Set(c.map(x => x?.id).filter(Boolean));
+    const matching = [...localIds].filter(id => cloudIds.has(id));
+    const localOnly = [...localIds].filter(id => !cloudIds.has(id));
+    const cloudOnly = [...cloudIds].filter(id => !localIds.has(id));
+    const localDup = l.filter(r => equivalentRecords(name,r,l).length).length;
+    const cloudDup = c.filter(r => equivalentRecords(name,r,c).length).length;
+    return `<tr>
+      <td><b>${name}</b></td><td>${l.length}</td><td>${c.length}</td>
+      <td>${matching.length}</td><td>${localOnly.length}</td><td>${cloudOnly.length}</td>
+      <td>${localDup}</td><td>${cloudDup}</td>
+      <td>${duplicateIdCount(l)}</td><td>${duplicateIdCount(c)}</td>
+    </tr>`;
+  }).join('');
+
+  $('counts').innerHTML = `
+    <table>
+      <tr>
+        <th>Collection</th><th>Local</th><th>Firestore</th>
+        <th>Matching IDs</th><th>Local-only IDs</th><th>Firestore-only IDs</th>
+        <th>Local equivalent duplicates*</th><th>Cloud equivalent duplicates*</th>
+        <th>Repeated local IDs</th><th>Repeated cloud IDs</th>
+      </tr>${rows}
+    </table>
+    <div class="small">*Equivalent is based on explicit field comparisons; matching names alone are never treated as proof.</div>`;
+}
+
+function renderRecords(local, cloud) {
+  let html = '';
+
+  for (const name of COLLECTIONS) {
+    const l = local[name] || [];
+    const c = cloud[name] || [];
+    const localMap = new Map(l.filter(r=>r?.id).map(r=>[r.id,r]));
+    const cloudMap = new Map(c.filter(r=>r?.id).map(r=>[r.id,r]));
+    const ids = [...new Set([...localMap.keys(),...cloudMap.keys()])].sort();
+
+    html += `<h3>${name}</h3><table>
+      <tr><th>Application ID</th><th>Firestore document ID</th><th>Local record</th>
+      <th>Firestore record</th><th>Equivalent under another ID?</th><th>Local/cloud differ?</th></tr>`;
+
+    for (const id of ids) {
+      const localRecord = localMap.get(id);
+      const cloudRecord = cloudMap.get(id);
+      const equivalents = [
+        ...(localRecord ? equivalentRecords(name,localRecord,l) : []),
+        ...(cloudRecord ? equivalentRecords(name,cloudRecord,c) : [])
+      ];
+      const uniqueEquivalentIds = [...new Set(equivalents.map(x=>x.id).filter(Boolean))];
+      const differs = localRecord && cloudRecord ? !equalRecords(localRecord,cloudRecord) : false;
+
+      html += `<tr class="${differs?'diff':''}">
+        <td class="mono">${safe(localRecord?.id || cloudRecord?.id)}</td>
+        <td class="mono">${safe(cloudRecord?.__docId || '—')}</td>
+        <td><pre>${localRecord ? safe(pretty(localRecord)) : '—'}</pre></td>
+        <td><pre>${cloudRecord ? safe(pretty(cloudRecord)) : '—'}</pre></td>
+        <td class="mono">${uniqueEquivalentIds.length ? uniqueEquivalentIds.join(', ') : '—'}</td>
+        <td>${differs ? '<span class="warn">YES</span>' : '<span class="ok">NO</span>'}</td>
+      </tr>`;
+    }
+
+    html += '</table>';
+  }
+
+  $('records').innerHTML = html || '<p>No records.</p>';
+}
+
+function renderTables(local, cloud) {
+  const all = [
+    ...(local.tables || []).map(x=>({...x,__source:'local'})),
+    ...(cloud.tables || []).map(x=>({...x,__source:'firestore'}))
+  ];
+
+  const orderRefs = new Map();
+  for (const table of all) {
+    if (!table.orderId) continue;
+    if (!orderRefs.has(table.orderId)) orderRefs.set(table.orderId,[]);
+    orderRefs.get(table.orderId).push(`${table.__source}:${table.id}`);
+  }
+
+  const table01 = all.filter(t => Number(t.number) === 1 || t.label === 'Table 01');
+
+  $('tables').innerHTML = `
+    <p><b>Table 01 candidates:</b> ${table01.length}</p>
+    <p><b>Different table IDs sharing an orderId:</b> ${
+      [...orderRefs.values()].filter(v=>v.length>1).length
+    }</p>
+    <table>
+      <tr><th>Source</th><th>Table ID</th><th>Number</th><th>Label</th><th>orderId</th><th>Shared orderId?</th></tr>
+      ${all.map(t => {
+        const refs = t.orderId ? orderRefs.get(t.orderId) || [] : [];
+        return `<tr>
+          <td>${safe(t.__source)}</td>
+          <td class="mono">${safe(t.id)}</td>
+          <td>${safe(t.number)}</td>
+          <td>${safe(t.label)}</td>
+          <td class="mono">${safe(t.orderId || '—')}</td>
+          <td>${refs.length>1 ? '<span class="bad">'+refs.join(', ')+'</span>' : '—'}</td>
+        </tr>`;
+      }).join('')}
+    </table>`;
+}
+
+function renderProducts(local, cloud) {
+  const all = [
+    ...(local.products || []).map(x=>({...x,__source:'local'})),
+    ...(cloud.products || []).map(x=>({...x,__source:'firestore'}))
+  ];
+  const nameGroups = new Map();
+  for (const p of all) {
+    const key = String(p.name || '').trim().toLowerCase();
+    if (!key) continue;
+    if (!nameGroups.has(key)) nameGroups.set(key,[]);
+    nameGroups.get(key).push(p);
+  }
+  const duplicateNames = [...nameGroups.values()].filter(g=>g.length>1);
+
+  $('products').innerHTML = `
+    <p><b>Repeated product names:</b> ${duplicateNames.length}</p>
+    <table>
+      <tr><th>Source</th><th>Application ID</th><th>Document ID</th><th>Name</th><th>Price</th><th>Category ID</th><th>Equivalent IDs</th></tr>
+      ${all.map(p => {
+        const eq = equivalentRecords('products',p,all).map(x=>x.id).filter(Boolean);
+        return `<tr>
+          <td>${safe(p.__source)}</td><td class="mono">${safe(p.id)}</td>
+          <td class="mono">${safe(p.__docId || '—')}</td><td>${safe(p.name)}</td>
+          <td>${safe(p.price)}</td><td class="mono">${safe(p.categoryId || '—')}</td>
+          <td class="mono">${[...new Set(eq)].join(', ') || '—'}</td>
+        </tr>`;
+      }).join('')}
+    </table>`;
+}
+
+function renderOrders(local, cloud) {
+  const all = [
+    ...(local.orders || []).map(x=>({...x,__source:'local'})),
+    ...(cloud.orders || []).map(x=>({...x,__source:'firestore'}))
+  ];
+
+  const groups = new Map();
+  for (const o of all) {
+    const key = JSON.stringify({
+      tableId:o.tableId || null,
+      total:Number(o.total || 0),
+      status:o.status || null,
+      paymentStatus:o.paymentStatus || null,
+      items:o.items || []
+    });
+    if (!groups.has(key)) groups.set(key,[]);
+    groups.get(key).push(o);
+  }
+
+  const duplicateGroups = [...groups.values()].filter(g=>g.length>1);
+
+  $('orders').innerHTML = `
+    <p><b>Equivalent logical order groups:</b> ${duplicateGroups.length}</p>
+    <table>
+      <tr><th>Source</th><th>Application ID</th><th>Document ID</th><th>Table ID</th>
+      <th>Status</th><th>Payment</th><th>Total</th><th>Items</th><th>Equivalent IDs</th></tr>
+      ${all.map(o => {
+        const key = JSON.stringify({
+          tableId:o.tableId || null,
+          total:Number(o.total || 0),
+          status:o.status || null,
+          paymentStatus:o.paymentStatus || null,
+          items:o.items || []
+        });
+        const group = groups.get(key) || [];
+        const ids = group.map(x=>x.id).filter(id=>id!==o.id);
+        return `<tr>
+          <td>${safe(o.__source)}</td><td class="mono">${safe(o.id)}</td>
+          <td class="mono">${safe(o.__docId || '—')}</td>
+          <td class="mono">${safe(o.tableId || '—')}</td>
+          <td>${safe(o.status || '—')}</td><td>${safe(o.paymentStatus || '—')}</td>
+          <td>${safe(o.total)}</td><td>${safe(o.itemCount || (o.items||[]).length)}</td>
+          <td class="mono">${[...new Set(ids)].join(', ') || '—'}</td>
+        </tr>`;
+      }).join('')}
+    </table>`;
+}
+
+function renderMetadata(cloud) {
+  $('metadata').innerHTML = `
+    <p><b>settings/main:</b></p>
+    <pre>${cloud.settings ? safe(pretty(cloud.settings)) : 'Not found'}</pre>
+    <p><b>meta/migration:</b> informational only; never used as proof of business data.</p>
+    <pre>${cloud.migration ? safe(pretty(cloud.migration)) : 'Not found'}</pre>`;
+}
+
+async function refresh() {
+  if (refreshInFlight) return;
+  refreshInFlight = true;
+  $('refresh').disabled = true;
+  setAuth('Refreshing live diagnostics…', 'warn');
+
+  try {
+    await authReadyPromise;
+
+    const user = auth.currentUser || currentUser;
+    if (!user) {
+      setAuth('No authenticated Firebase user after Auth initialization.', 'bad');
+      $('uid').textContent = '';
+      $('authDetails').textContent =
+        'Firebase Auth has finished restoring its persisted session, and currentUser is null. ' +
+        'If the POS is signed in, verify this diagnostic page is hosted on the same origin as the POS.';
+      $('refresh').disabled = false;
+      return;
+    }
+
+    currentUser = user;
+    $('uid').textContent = `UID: ${user.uid}`;
+    $('authDetails').textContent =
+      `Origin: ${location.origin} · persistence: browserLocalPersistence · Auth initialized: yes`;
+
+    const localRaw = readLocal();
+    const local = normalizeLocal(localRaw.state || {});
+    const cloud = await readCloud(user.uid);
+
+    lastSnapshot = {
+      authenticatedUid:user.uid,
+      localStorageKey:STORE_KEY,
+      localRaw,
+      local,
+      cloud,
+      at:new Date().toISOString()
+    };
+
+    renderCounts(local,cloud);
+    renderRecords(local,cloud);
+    renderTables(local,cloud);
+    renderProducts(local,cloud);
+    renderOrders(local,cloud);
+    renderMetadata(cloud);
+    $('raw').textContent = pretty(lastSnapshot);
+    setAuth('Authenticated — live diagnostics loaded.', 'ok');
+  } catch (error) {
+    showRuntimeError('Diagnostic refresh', error);
+  } finally {
+    refreshInFlight = false;
+    $('refresh').disabled = !authResolved || !currentUser;
+  }
+}
+
+let authReadyPromise;
+
+async function initializeAuth() {
+  try {
+    setAuth('Initializing Firebase app…', 'warn');
+
+    app = initializeApp(firebaseConfig);
+    auth = getAuth(app);
+    db = getFirestore(app);
+
+    if (app.options.apiKey !== firebaseConfig.apiKey ||
+        app.options.authDomain !== firebaseConfig.authDomain ||
+        app.options.projectId !== firebaseConfig.projectId ||
+        app.options.appId !== firebaseConfig.appId) {
+      throw new Error('Firebase configuration mismatch.');
+    }
+
+    // Establish the same persistence used by the POS BEFORE checking currentUser.
+    await setPersistence(auth, browserLocalPersistence);
+
+    // Firebase Auth exposes this promise specifically for waiting until the
+    // initial persisted session has been resolved. Do not treat a transient
+    // auth.currentUser === null as signed-out before this point.
+    if (typeof auth.authStateReady === 'function') {
+      await auth.authStateReady();
+    } else {
+      await new Promise(resolve => {
+        let done = false;
+        const unsub = onAuthStateChanged(auth, () => {
+          if (done) return;
+          done = true;
+          unsub();
+          resolve();
+        }, error => {
+          if (done) return;
+          done = true;
+          unsub();
+          reject(error);
+        });
+      });
+    }
+
+    authResolved = true;
+    currentUser = auth.currentUser || null;
+
+    // Keep listening after initial restoration so a sign-in/sign-out in another
+    // tab on the same origin updates this page as well.
+    unsubscribeAuth = onAuthStateChanged(auth, async user => {
+      try {
+        currentUser = user || null;
+        if (user) {
+          authResolved = true;
+          $('refresh').disabled = false;
+          await refresh();
+        } else {
+          authResolved = true;
+          $('refresh').disabled = false;
+          setAuth('Firebase Auth resolved: signed out.', 'warn');
+          $('uid').textContent = '';
+          $('authDetails').textContent =
+            'No persisted Firebase user is available for this page origin.';
+        }
+      } catch (error) {
+        showRuntimeError('Auth state listener', error);
+      }
+    });
+
+    $('refresh').disabled = false;
+
+    if (currentUser) {
+      setAuth('Authenticated — Firebase session restored.', 'ok');
+      $('uid').textContent = `UID: ${currentUser.uid}`;
+      await refresh();
+    } else {
+      setAuth('Firebase Auth initialized, but no user is signed in.', 'warn');
+      $('authDetails').textContent =
+        'Auth restoration is complete. If the POS is signed in, the diagnostic page must be on the same origin.';
+    }
+  } catch (error) {
+    authResolved = false;
+    showRuntimeError('Firebase/Auth initialization', error);
+    $('refresh').disabled = true;
+  }
+}
+
+$('refresh').addEventListener('click', async event => {
+  event.preventDefault();
+  console.info('[1911 diagnostics] Refresh diagnostics clicked');
+  try {
+    await refresh();
+  } catch (error) {
+    showRuntimeError('Refresh button handler', error);
+  }
+});
+
+$('openPos').addEventListener('click', () => {
+  try {
+    window.open('./index.html','_blank','noopener');
+  } catch (error) {
+    showRuntimeError('Open POS button handler', error);
+  }
+});
+
+window.addEventListener('error', event => {
+  showRuntimeError('Uncaught JavaScript error', event.error || new Error(event.message));
+});
+
+window.addEventListener('unhandledrejection', event => {
+  showRuntimeError('Unhandled promise rejection', event.reason || new Error('Unknown rejection'));
+});
+
+initializeAuth();
+</script>
+</body>
+</html>
