@@ -1722,7 +1722,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   let authBusy = false;
   let uiBound = false;
   let processedAuthUid = null;
-  let rolloverTimer = null;
   let localStateWasPresent = false;
   let cloudHydrationInProgress = false;
   let cloudPersistenceEnabled = false;
@@ -1887,7 +1886,12 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     } catch (e) {
       console.warn('localStorage save failed:', e);
     }
-    if (cloudPersistenceEnabled && !cloudHydrationInProgress) {
+  }
+
+  // Explicit persistence trigger for genuine business-data mutations only.
+  // UI-only/local state changes continue through saveState() without a cloud write.
+  function persistBusinessMutation() {
+    if (cloudPersistenceEnabled && !cloudHydrationInProgress && sessionProfile?.uid) {
       scheduleCloudPersistence();
     }
   }
@@ -2661,6 +2665,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     order.notes = String(value || '');
     order.updatedAt = Date.now();
     saveState();
+    persistBusinessMutation();
     renderAll();
     refreshCurrentOrderWorkspace();
   }
@@ -3016,6 +3021,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     recalcOrder(order);
     state.currentOrderId = order.id;
     saveState();
+    persistBusinessMutation();
     renderAll();
     toast(`${type === 'takeaway' ? 'Takeaway' : 'Table'} order created.`);
     return order;
@@ -3178,7 +3184,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
     if (!uiBound) bindEvents();
     renderAll();
-    scheduleRolloverSafeSave();
   }
 
   async function handleLoginSubmit(event) {
@@ -3263,7 +3268,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     renderOrderPanel();
     renderHistory();
     renderQuickReports();
-    saveState();
   }
 
   function renderHeaderState() {
@@ -3684,6 +3688,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     recalcOrder(order);
     order.updatedAt = Date.now();
     saveState();
+    persistBusinessMutation();
     renderAll();
     refreshCurrentOrderWorkspace();
     toast(`${product.name} added to order.`);
@@ -3697,7 +3702,8 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     item.qty += 1;
     recalcOrder(order);
     order.updatedAt = Date.now();
-    saveState(); renderAll();
+    saveState();
+    persistBusinessMutation(); renderAll();
     refreshCurrentOrderWorkspace();
   }
 
@@ -3710,7 +3716,8 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     if (item.qty <= 0) order.items = order.items.filter(i => i.key !== itemKey);
     recalcOrder(order);
     order.updatedAt = Date.now();
-    saveState(); renderAll();
+    saveState();
+    persistBusinessMutation(); renderAll();
     refreshCurrentOrderWorkspace();
   }
 
@@ -3720,7 +3727,8 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     order.items = order.items.filter(i => i.key !== itemKey);
     recalcOrder(order);
     order.updatedAt = Date.now();
-    saveState(); renderAll();
+    saveState();
+    persistBusinessMutation(); renderAll();
     refreshCurrentOrderWorkspace();
   }
 
@@ -3732,7 +3740,8 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     const note = prompt(`Note for ${item.productName}:`, item.note || '');
     if (note === null) return;
     item.note = note.trim();
-    saveState(); renderAll();
+    saveState();
+    persistBusinessMutation(); renderAll();
     refreshCurrentOrderWorkspace();
   }
 
@@ -3765,7 +3774,8 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     order.status = 'sent';
     order.updatedAt = Date.now();
     recalcOrder(order);
-    saveState(); renderAll();
+    saveState();
+    persistBusinessMutation(); renderAll();
     refreshCurrentOrderWorkspace();
     toast('Order sent.');
   }
@@ -3798,6 +3808,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       recalcOrder(order);
       order.updatedAt = Date.now();
       saveState();
+      persistBusinessMutation();
       closeModal();
       renderAll();
       refreshCurrentOrderWorkspace();
@@ -3915,6 +3926,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
     state.currentOrderId = state.activeOrders[0]?.id || null;
     saveState();
+    persistBusinessMutation();
     renderAll();
     closeModal();
     toast(stockWarnings.length ? `Payment completed. Stock warnings: ${stockWarnings.join(', ')}` : 'Payment completed.');
@@ -3949,6 +3961,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       });
     });
     saveState();
+    persistBusinessMutation();
     return [...new Set([...warnings, ...unitWarnings])];
   }
 
@@ -3957,7 +3970,8 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     if (!order) return;
     if (order.status === 'paid') {
       state.currentOrderId = state.activeOrders[0]?.id || null;
-      saveState(); renderAll();
+      saveState();
+    persistBusinessMutation(); renderAll();
       return;
     }
     if (order.items.length && !confirm('Close this order without payment?')) return;
@@ -3971,6 +3985,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     state.activeOrders = state.activeOrders.filter(o => o.id !== order.id);
     state.currentOrderId = state.activeOrders[0]?.id || null;
     saveState();
+    persistBusinessMutation();
     renderAll();
     toast('Order closed.');
   }
@@ -4036,6 +4051,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     order.sentAt = Date.now();
     order.updatedAt = Date.now();
     saveState();
+    persistBusinessMutation();
     renderAll();
     refreshCurrentOrderWorkspace();
     closeModal();
@@ -4366,6 +4382,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     }
     state.adminSelection = null;
     saveState();
+    persistBusinessMutation();
     renderAll();
     renderAdmin();
     toast('Product saved.');
@@ -4390,6 +4407,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     state.products = state.products.filter(p => p.id !== id);
     // remove references from active and historical orders? keep historical snapshots intact
     saveState();
+    persistBusinessMutation();
     renderAll();
     renderAdmin();
     toast('Product deleted.');
@@ -4402,6 +4420,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     if (next < 0 || next >= state.products.length) return;
     [state.products[idx], state.products[next]] = [state.products[next], state.products[idx]];
     saveState();
+    persistBusinessMutation();
     renderAdmin();
     renderProducts();
   }
@@ -4507,6 +4526,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     state.categories.sort((a,b) => a.order - b.order);
     state.adminSelection = null;
     saveState();
+    persistBusinessMutation();
     renderAll();
     renderAdmin();
     toast('Category saved.');
@@ -4519,6 +4539,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     [state.categories[idx], state.categories[next]] = [state.categories[next], state.categories[idx]];
     state.categories.forEach((c, i) => c.order = i + 1);
     saveState();
+    persistBusinessMutation();
     renderAdmin();
     renderCategories();
   }
@@ -4534,6 +4555,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     state.categories = state.categories.filter(c => c.id !== id);
     state.adminSelection = null;
     saveState();
+    persistBusinessMutation();
     renderAll();
     renderAdmin();
   }
@@ -4623,6 +4645,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     state.settings.tableCount = state.tables.length;
     state.adminSelection = null;
     saveState();
+    persistBusinessMutation();
     renderAll();
     renderAdmin();
     toast('Table saved.');
@@ -4653,6 +4676,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       state.currentOrderId = null;
     }
     saveState();
+    persistBusinessMutation();
     renderAll();
     renderAdmin();
   }
@@ -4780,6 +4804,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     }
     state.adminSelection = null;
     saveState();
+    persistBusinessMutation();
     renderAll();
     renderAdmin();
     toast('Inventory saved.');
@@ -4795,6 +4820,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     state.inventory = state.inventory.filter(i => i.id !== id);
     state.adminSelection = null;
     saveState();
+    persistBusinessMutation();
     renderAll();
     renderAdmin();
   }
@@ -5039,6 +5065,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     }
     state.adminSelection = null;
     saveState();
+    persistBusinessMutation();
     ensureCurrentStaff();
     renderAll();
     renderAdmin();
@@ -5055,6 +5082,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     state.adminSelection = null;
     ensureCurrentStaff();
     saveState();
+    persistBusinessMutation();
     renderAll();
     renderAdmin();
   }
@@ -5070,6 +5098,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     }
     state.currentStaffId = st.id;
     saveState();
+    persistBusinessMutation();
     renderAll();
     renderAdmin();
     toast(`Switched to ${st.name}.`);
@@ -5148,6 +5177,7 @@ function saveShiftDuty() {
     if (current) current.active = true;
   }
   saveState();
+    persistBusinessMutation();
   renderAll();
   closeModal();
   toast('Shift updated.');
@@ -5162,6 +5192,7 @@ function quickSwitchStaff(id) {
     if (String(pin) !== String(st.pin)) return toast('Wrong PIN.');
     state.currentStaffId = st.id;
     saveState();
+    persistBusinessMutation();
     renderAll();
     closeModal();
     toast(`Welcome, ${st.name}.`);
@@ -5224,6 +5255,7 @@ function quickSwitchStaff(id) {
     if (!state.settings.paymentMethods.length) state.settings.paymentMethods = ['Cash', 'Card', 'Other'];
     state.settings.lowStockAlerts = $('set_lowstock').checked;
     saveState();
+    persistBusinessMutation();
     renderAll();
     renderAdmin();
     toast('Settings saved.');
@@ -5279,19 +5311,6 @@ function quickSwitchStaff(id) {
 
   function escapeAttr(str) {
     return escapeHtml(str).replace(/`/g, '&#96;');
-  }
-
-  function scheduleRolloverSafeSave() {
-    if (rolloverTimer) return;
-
-    rolloverTimer = setInterval(() => {
-      saveState();
-      if (!authReady || !sessionProfile) return;
-      renderStats();
-      renderQuickReports();
-      renderOrderPanel();
-      renderHistory();
-    }, 30000);
   }
 
   // Expose controlled API for inline handlers
@@ -5408,6 +5427,7 @@ function quickSwitchStaff(id) {
     order.sentAt = Date.now();
     order.updatedAt = Date.now();
     saveState();
+    persistBusinessMutation();
     renderAll();
     toast('Order sent.');
   };
@@ -5796,6 +5816,7 @@ function payOrCloseTakeaway() {
     recalcOrder(order);
     order.updatedAt = Date.now();
     saveState();
+    persistBusinessMutation();
     renderAll();
 
     if (state.modalContext === 'table-flow' && state.activeTableFlowId) {
