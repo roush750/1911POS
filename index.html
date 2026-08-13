@@ -1729,9 +1729,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   let cloudSyncTimer = null;
   let cloudSyncInFlight = false;
   let cloudSyncPending = false;
-  // Snapshot of the last cloud-confirmed business state. Used to persist only
-  // documents that actually changed, while saveState() remains local-first.
-  let cloudSyncBaseline = null;
 
   const defaultState = () => ({
     settings: {
@@ -1936,16 +1933,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     };
   }
 
-  function businessSnapshotForDiff(business) {
-    const snapshot = {};
-    for (const name of CLOUD_COLLECTIONS) {
-      snapshot[name] = new Map((business[name] || []).filter(r => r?.id).map(r => [String(r.id), JSON.stringify(r)]));
-    }
-    snapshot.settings = JSON.stringify(business.settings || {});
-    snapshot.orderSequence = Number(business.orderSequence || 1);
-    return snapshot;
-  }
-
   async function readCloudBusinessState(uid) {
     const results = await Promise.all([
       ...CLOUD_COLLECTIONS.map(name => getDocs(cloudCollectionRef(uid, name))),
@@ -1953,9 +1940,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     ]);
     const cloud = { categories: [], products: [], inventory: [], orders: [], tables: [], staff: [], settings: null };
     CLOUD_COLLECTIONS.forEach((name, index) => {
-      cloud[name] = results[index].docs
-        .map(snap => ({ id: snap.id, ...snap.data() }))
-        .filter(record => record?.id);
+      cloud[name] = results[index].docs.map(snap => ({ id: snap.id, ...snap.data() }));
     });
     const settingsSnap = results[CLOUD_COLLECTIONS.length];
     cloud.settings = settingsSnap.exists() ? (settingsSnap.data() || {}) : null;
@@ -1968,6 +1953,9 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     (cloudRecords || []).forEach(record => {
       if (record?.id) merged.set(record.id, safeClone(record));
     });
+    // When local Phase 2 state exists, preserve every local business record.
+    // Cloud-only records are added; an identical ID keeps the local version so
+    // hydration cannot silently overwrite a valid local record.
     (localRecords || []).forEach(record => {
       if (record?.id) merged.set(record.id, safeClone(record));
     });
@@ -2000,57 +1988,33 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     ensureCurrentStaff();
   }
 
-  async function writeCloudChanges(uid, source = 'localStorage', forceFullSync = false) {
+  async function writeCloudBusinessState(uid, source = 'localStorage') {
     const business = businessStateForCloud();
-    const current = businessSnapshotForDiff(business);
-    const baseline = forceFullSync || !cloudSyncBaseline ? null : cloudSyncBaseline;
     const writes = [];
-
     for (const name of CLOUD_COLLECTIONS) {
-      const currentMap = current[name];
-      const baselineMap = baseline?.[name] || new Map();
-
-      // New/changed documents only.
-      for (const record of business[name] || []) {
+      for (const record of business[name]) {
         if (!record?.id) continue;
-        const id = String(record.id);
-        if (forceFullSync || baselineMap.get(id) !== currentMap.get(id)) {
-          writes.push([cloudDocRef(uid, name, id), record]);
-        }
-      }
-
-    }
-
-    if (writes.length) {
-      const chunkSize = 450;
-      for (let i = 0; i < writes.length; i += chunkSize) {
-        const batch = writeBatch(db);
-        writes.slice(i, i + chunkSize).forEach(([ref, record]) => batch.set(ref, record));
-        await batch.commit();
+        writes.push([cloudDocRef(uid, name, record.id), record]);
       }
     }
-
-    if (forceFullSync || !baseline || current.settings !== baseline.settings || current.orderSequence !== baseline.orderSequence) {
-      await setDoc(cloudSettingsRef(uid), {
-        settings: business.settings,
-        orderSequence: business.orderSequence,
-        updatedAt: Date.now()
-      }, { merge: true });
+    const chunkSize = 450;
+    for (let i = 0; i < writes.length; i += chunkSize) {
+      const batch = writeBatch(db);
+      writes.slice(i, i + chunkSize).forEach(([ref, record]) => batch.set(ref, record));
+      await batch.commit();
     }
-
-    cloudSyncBaseline = current;
-
-    if (forceFullSync) {
-      await setDoc(cloudMigrationRef(uid), {
-        status: 'completed',
-        informationalOnly: true,
-        source,
-        migratedAt: Date.now(),
-        counts: Object.fromEntries(CLOUD_COLLECTIONS.map(name => [name, business[name].length]))
-      }, { merge: true });
-    }
-
-    return writes.length;
+    await setDoc(cloudSettingsRef(uid), {
+      settings: business.settings,
+      orderSequence: business.orderSequence,
+      updatedAt: Date.now()
+    }, { merge: true });
+    await setDoc(cloudMigrationRef(uid), {
+      status: 'completed',
+      informationalOnly: true,
+      source,
+      migratedAt: Date.now(),
+      counts: Object.fromEntries(CLOUD_COLLECTIONS.map(name => [name, business[name].length]))
+    }, { merge: true });
   }
 
   function scheduleCloudPersistence() {
@@ -2069,7 +2033,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     cloudSyncInFlight = true;
     cloudSyncPending = false;
     try {
-      await writeCloudChanges(sessionProfile.uid, localStateWasPresent ? 'localStorage' : 'application', false);
+      await writeCloudBusinessState(sessionProfile.uid, localStateWasPresent ? 'localStorage' : 'application');
     } catch (error) {
       console.warn('Firestore persistence failed:', error?.code || error?.message || error);
     } finally {
@@ -2082,36 +2046,32 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     cloudHydrationInProgress = true;
     cloudPersistenceEnabled = false;
     try {
-      // Phase 3 is now established and the normal browser already has its
-      // persisted business state. Until Phase 4 adds realtime synchronization,
-      // keep that normal browser local-first and do not re-read every collection
-      // on every login/refresh. A fresh browser has no local state and therefore
-      // takes the full Firestore hydration path below.
-      if (localStateWasPresent) {
-        cloudSyncBaseline = businessSnapshotForDiff(businessStateForCloud());
-        cloudPersistenceEnabled = true;
-        return { mode: 'local-first', hasBusinessRecords: true };
-      }
-
-      // Fresh browser: read the actual business collections. Migration metadata
-      // is intentionally not used as proof that business data exists.
       const cloud = await readCloudBusinessState(uid);
       if (cloud.hasBusinessRecords) {
         applyCloudBusinessState(cloud);
-        cloudSyncBaseline = businessSnapshotForDiff(businessStateForCloud());
         saveState();
         cloudPersistenceEnabled = true;
         return { mode: 'hydrated', hasBusinessRecords: true };
       }
 
+      if (localStateWasPresent) {
+        await writeCloudBusinessState(uid, 'localStorage');
+        cloudPersistenceEnabled = true;
+        return { mode: 'migrated', hasBusinessRecords: false };
+      }
+
       // Fresh browser with no local state and no cloud records: keep the normal
       // Phase 2 defaults and persist them once authentication is authorized.
-      await writeCloudChanges(uid, 'defaultState', true);
+      await writeCloudBusinessState(uid, 'defaultState');
       cloudPersistenceEnabled = true;
       return { mode: 'initialized', hasBusinessRecords: false };
     } finally {
       cloudHydrationInProgress = false;
     }
+  }
+
+  function safeClone(v) {
+    return JSON.parse(JSON.stringify(v));
   }
 
   function migrateAndNormalize() {
