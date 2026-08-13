@@ -3659,18 +3659,31 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function finalizeOrder(orderId, paymentMethod, cashReceived, closeTableAfterPayment = true) {
-    const order = getOrderById(orderId);
-    if (!order) return;
-    if (order.status === 'paid' || order.paymentStatus === 'paid') {
-      toast('This order has already been paid.');
-      closeModal();
-      renderAll();
+    // Resolve the order strictly from the ACTIVE collection. Checkout must
+    // complete the live order session, never a historical copy that happens
+    // to share the same ID.
+    const activeIndex = state.activeOrders.findIndex(o => o && o.id === orderId);
+    if (activeIndex < 0) {
+      const existingHistory = (state.orders || []).find(o => o && o.id === orderId);
+      if (existingHistory?.status === 'paid' || existingHistory?.paymentStatus === 'paid') {
+        toast('This order has already been paid.');
+        closeModal();
+        state.checkoutDraft = null;
+        state.modalContext = null;
+        state.activeTableFlowId = null;
+        state.pendingTableId = null;
+        state.flowStage = 'order';
+        state.orderEditMode = false;
+        renderAll();
+      }
       return;
     }
 
-    // Complete the entire business-state transition in memory first. No render
-    // or cloud persistence occurs until the canonical state is internally
-    // consistent. This prevents a partially-completed order from being saved.
+    // Mutate the canonical active-order object exactly once. All business
+    // changes happen before any rendering or cloud persistence.
+    const order = state.activeOrders[activeIndex];
+    if (order.status === 'paid' || order.paymentStatus === 'paid') return;
+
     recalcOrder(order);
     const stockWarnings = deductInventory(order);
 
@@ -3686,36 +3699,45 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     order.paidAt = Date.now();
     order.updatedAt = Date.now();
 
-    state.activeOrders = state.activeOrders.filter(o => o.id !== order.id);
-
-    // Preserve one logical order record: the same application ID becomes the
-    // completed/history record rather than creating a second order ID.
+    // Move the SAME logical order ID from activeOrders to orders. Do not clone
+    // it into a second logical record.
+    state.activeOrders.splice(activeIndex, 1);
     const completedOrder = safeClone(order);
     state.orders = [completedOrder, ...(state.orders || []).filter(o => o.id !== order.id)];
 
+    // Release the table exactly once.
     const table = order.tableId ? getTableById(order.tableId) : null;
-    if (table) {
-      // Payment always releases the table in the existing Phase 3 behavior.
+    if (table && table.orderId === order.id) {
       table.orderId = null;
       table.lastClosedAt = Date.now();
     }
 
+    // Clear every checkout/flow selection before the first render.
     state.currentOrderId = state.activeOrders[0]?.id || null;
     state.checkoutDraft = null;
-
-    // One local save for the complete state transition. Cloud persistence is
-    // asynchronous and never blocks completion.
-    saveState();
-
-    // Close the checkout UI first, then render from the now-canonical state so
-    // tables, active orders, history, revenue, and reports update immediately.
-    closeModal();
     state.modalContext = null;
     state.activeTableFlowId = null;
     state.pendingTableId = null;
     state.flowStage = 'order';
     state.orderEditMode = false;
+
+    // Persist the completed canonical local state once. Cloud persistence stays
+    // asynchronous and offline-safe.
+    saveState();
+
+    // Close the modal and immediately paint every affected view from the new
+    // canonical state. The animation-frame pass is only a DOM reconciliation
+    // safeguard for the modal/table-flow transition; it performs no state or
+    // Firestore mutation.
+    closeModal();
     renderAll();
+    requestAnimationFrame(() => {
+      if (!authReady || !sessionProfile) return;
+      renderTables();
+      renderOrderPanel();
+      renderHistory();
+      renderQuickReports();
+    });
 
     toast(stockWarnings.length
       ? `Payment completed. Stock warnings: ${stockWarnings.join(', ')}`
