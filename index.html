@@ -1888,34 +1888,9 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     } catch (e) {
       console.warn('localStorage save failed:', e);
     }
-
-    // saveState() is intentionally local-first. Only schedule cloud work when
-    // cloud-backed business data actually changed. UI/navigation state changes
-    // (search, modal context, selected category, etc.) must not start a cloud
-    // persistence pass.
     if (cloudPersistenceEnabled && !cloudHydrationInProgress) {
-      const currentBusinessSnapshot = businessSnapshotForDiff(businessStateForCloud());
-      // Compare against the last successfully synchronized cloud baseline, not
-      // merely the previous local save. If a cloud write failed, the difference
-      // remains visible here and the next save/retry will continue to schedule
-      // persistence rather than silently considering the data synchronized.
-      const cloudNeedsUpdate = !cloudSyncBaseline || !businessSnapshotsEqual(cloudSyncBaseline, currentBusinessSnapshot);
-      if (cloudNeedsUpdate) scheduleCloudPersistence();
+      scheduleCloudPersistence();
     }
-  }
-
-  function businessSnapshotsEqual(a, b) {
-    if (!a || !b) return false;
-    if (a.settings !== b.settings || a.orderSequence !== b.orderSequence) return false;
-    for (const name of CLOUD_COLLECTIONS) {
-      const am = a[name] || new Map();
-      const bm = b[name] || new Map();
-      if (am.size !== bm.size) return false;
-      for (const [id, value] of am) {
-        if (bm.get(id) !== value) return false;
-      }
-    }
-    return true;
   }
 
   const CLOUD_COLLECTIONS = ['categories', 'products', 'inventory', 'orders', 'tables', 'staff'];
@@ -3043,6 +3018,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     renderOrderPanel();
     renderHistory();
     renderQuickReports();
+    saveState();
   }
 
   function renderHeaderState() {
@@ -3659,89 +3635,44 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function finalizeOrder(orderId, paymentMethod, cashReceived, closeTableAfterPayment = true) {
-    // Resolve the order strictly from the ACTIVE collection. Checkout must
-    // complete the live order session, never a historical copy that happens
-    // to share the same ID.
-    const activeIndex = state.activeOrders.findIndex(o => o && o.id === orderId);
-    if (activeIndex < 0) {
-      const existingHistory = (state.orders || []).find(o => o && o.id === orderId);
-      if (existingHistory?.status === 'paid' || existingHistory?.paymentStatus === 'paid') {
-        toast('This order has already been paid.');
-        closeModal();
-        state.checkoutDraft = null;
-        state.modalContext = null;
-        state.activeTableFlowId = null;
-        state.pendingTableId = null;
-        state.flowStage = 'order';
-        state.orderEditMode = false;
-        renderAll();
-      }
+    const order = getOrderById(orderId);
+    if (!order) return;
+    if (order.status === 'paid') {
+      toast('This order has already been paid.');
+      closeModal();
       return;
     }
-
-    // Mutate the canonical active-order object exactly once. All business
-    // changes happen before any rendering or cloud persistence.
-    const order = state.activeOrders[activeIndex];
-    if (order.status === 'paid' || order.paymentStatus === 'paid') return;
-
     recalcOrder(order);
-    const stockWarnings = deductInventory(order);
 
+    const stockWarnings = deductInventory(order);
     order.status = 'paid';
     order.paymentStatus = 'paid';
     order.paymentMethod = paymentMethod;
     order.cashReceived = Number(cashReceived || 0);
-    order.changeDue = paymentMethod === 'Cash'
-      ? Math.max(0, order.cashReceived - order.total)
-      : 0;
+    order.changeDue = paymentMethod === 'Cash' ? Math.max(0, order.cashReceived - order.total) : 0;
     order.staffPaidId = state.currentStaffId;
     order.staffPaidName = getCurrentStaff()?.name || '—';
     order.paidAt = Date.now();
     order.updatedAt = Date.now();
 
-    // Move the SAME logical order ID from activeOrders to orders. Do not clone
-    // it into a second logical record.
-    state.activeOrders.splice(activeIndex, 1);
-    const completedOrder = safeClone(order);
-    state.orders = [completedOrder, ...(state.orders || []).filter(o => o.id !== order.id)];
+    // move from active orders to completed
+    state.activeOrders = state.activeOrders.filter(o => o.id !== order.id);
+    state.orders.unshift(safeClone(order));
 
-    // Release the table exactly once.
     const table = order.tableId ? getTableById(order.tableId) : null;
-    if (table && table.orderId === order.id) {
+    if (table && closeTableAfterPayment) {
+      table.orderId = null;
+      table.lastClosedAt = Date.now();
+    } else if (table) {
       table.orderId = null;
       table.lastClosedAt = Date.now();
     }
 
-    // Clear every checkout/flow selection before the first render.
     state.currentOrderId = state.activeOrders[0]?.id || null;
-    state.checkoutDraft = null;
-    state.modalContext = null;
-    state.activeTableFlowId = null;
-    state.pendingTableId = null;
-    state.flowStage = 'order';
-    state.orderEditMode = false;
-
-    // Persist the completed canonical local state once. Cloud persistence stays
-    // asynchronous and offline-safe.
     saveState();
-
-    // Close the modal and immediately paint every affected view from the new
-    // canonical state. The animation-frame pass is only a DOM reconciliation
-    // safeguard for the modal/table-flow transition; it performs no state or
-    // Firestore mutation.
-    closeModal();
     renderAll();
-    requestAnimationFrame(() => {
-      if (!authReady || !sessionProfile) return;
-      renderTables();
-      renderOrderPanel();
-      renderHistory();
-      renderQuickReports();
-    });
-
-    toast(stockWarnings.length
-      ? `Payment completed. Stock warnings: ${stockWarnings.join(', ')}`
-      : 'Payment completed.');
+    closeModal();
+    toast(stockWarnings.length ? `Payment completed. Stock warnings: ${stockWarnings.join(', ')}` : 'Payment completed.');
   }
 
   function deductInventory(order) {
@@ -3772,6 +3703,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
         }
       });
     });
+    saveState();
     return [...new Set([...warnings, ...unitWarnings])];
   }
 
@@ -5074,13 +5006,13 @@ function quickSwitchStaff(id) {
     }
   }
 
-  function closeModal(persistLocalState = false) {
+  function closeModal() {
     $('modal').classList.remove('open');
     $('modalBody').innerHTML = '';
     $('modalTitle').textContent = 'Modal';
     $('modalSubtitle').textContent = '';
     state.checkoutDraft = null;
-    if (persistLocalState) saveState();
+    saveState();
   }
 
   function toast(message) {
