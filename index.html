@@ -1730,6 +1730,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   let cloudSyncPending = false;
   let realtimeSyncManager = null;
   let realtimeSyncUid = null;
+  let authTransitionToken = 0;
 
   const defaultState = () => ({
     settings: {
@@ -2153,12 +2154,15 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
   function replaceRealtimeRecord(collectionName, recordId, record) {
     const id = String(recordId);
+    const cloned = safeClone({ ...record, id });
 
     if (collectionName === 'orders') {
-      state.activeOrders = (state.activeOrders || []).filter(order => order?.id !== id);
-      state.orders = (state.orders || []).filter(order => order?.id !== id);
+      // Firestore document ID is the sole canonical identity. Remove every
+      // local occurrence of the ID from both arrays before inserting exactly
+      // one authoritative representation in the correct array.
+      state.activeOrders = (state.activeOrders || []).filter(order => String(order?.id) !== id);
+      state.orders = (state.orders || []).filter(order => String(order?.id) !== id);
 
-      const cloned = safeClone({ id, ...record });
       const isPaid = cloned.status === 'paid' || cloned.paymentStatus === 'paid';
       if (isPaid) state.orders.push(cloned);
       else state.activeOrders.push(cloned);
@@ -2172,11 +2176,11 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     const records = state[collectionName];
     if (!Array.isArray(records)) return;
 
-    const index = records.findIndex(item => String(item?.id) === id);
-    const cloned = safeClone({ id, ...record });
-
-    if (index >= 0) records[index] = cloned;
-    else records.push(cloned);
+    // Remove ALL local duplicates of this Firestore ID, then append the
+    // authoritative remote record exactly once. This also repairs duplicates
+    // that may already exist from a previous bad synchronization cycle.
+    state[collectionName] = records.filter(item => String(item?.id) !== id);
+    state[collectionName].push(cloned);
   }
 
   function removeRealtimeRecord(collectionName, recordId) {
@@ -2259,7 +2263,10 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
         this.unsubscribe.push(
           onSnapshot(
             cloudCollectionRef(this.uid, 'categories'),
-            snapshot => applyRealtimeCollectionSnapshot('categories', snapshot),
+            snapshot => {
+              if (realtimeSyncManager !== manager || !this.active || realtimeSyncUid !== this.uid) return;
+              applyRealtimeCollectionSnapshot('categories', snapshot);
+            },
             error => console.warn('Realtime categories listener failed:', error?.code || error?.message || error)
           )
         );
@@ -2267,7 +2274,10 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
         this.unsubscribe.push(
           onSnapshot(
             cloudCollectionRef(this.uid, 'products'),
-            snapshot => applyRealtimeCollectionSnapshot('products', snapshot),
+            snapshot => {
+              if (realtimeSyncManager !== manager || !this.active || realtimeSyncUid !== this.uid) return;
+              applyRealtimeCollectionSnapshot('products', snapshot);
+            },
             error => console.warn('Realtime products listener failed:', error?.code || error?.message || error)
           )
         );
@@ -2275,7 +2285,10 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
         this.unsubscribe.push(
           onSnapshot(
             cloudCollectionRef(this.uid, 'inventory'),
-            snapshot => applyRealtimeCollectionSnapshot('inventory', snapshot),
+            snapshot => {
+              if (realtimeSyncManager !== manager || !this.active || realtimeSyncUid !== this.uid) return;
+              applyRealtimeCollectionSnapshot('inventory', snapshot);
+            },
             error => console.warn('Realtime inventory listener failed:', error?.code || error?.message || error)
           )
         );
@@ -2283,7 +2296,10 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
         this.unsubscribe.push(
           onSnapshot(
             cloudCollectionRef(this.uid, 'orders'),
-            snapshot => applyRealtimeCollectionSnapshot('orders', snapshot),
+            snapshot => {
+              if (realtimeSyncManager !== manager || !this.active || realtimeSyncUid !== this.uid) return;
+              applyRealtimeCollectionSnapshot('orders', snapshot);
+            },
             error => console.warn('Realtime orders listener failed:', error?.code || error?.message || error)
           )
         );
@@ -2291,7 +2307,10 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
         this.unsubscribe.push(
           onSnapshot(
             cloudCollectionRef(this.uid, 'tables'),
-            snapshot => applyRealtimeCollectionSnapshot('tables', snapshot),
+            snapshot => {
+              if (realtimeSyncManager !== manager || !this.active || realtimeSyncUid !== this.uid) return;
+              applyRealtimeCollectionSnapshot('tables', snapshot);
+            },
             error => console.warn('Realtime tables listener failed:', error?.code || error?.message || error)
           )
         );
@@ -2299,7 +2318,10 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
         this.unsubscribe.push(
           onSnapshot(
             cloudCollectionRef(this.uid, 'staff'),
-            snapshot => applyRealtimeCollectionSnapshot('staff', snapshot),
+            snapshot => {
+              if (realtimeSyncManager !== manager || !this.active || realtimeSyncUid !== this.uid) return;
+              applyRealtimeCollectionSnapshot('staff', snapshot);
+            },
             error => console.warn('Realtime staff listener failed:', error?.code || error?.message || error)
           )
         );
@@ -2307,7 +2329,10 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
         this.unsubscribe.push(
           onSnapshot(
             cloudSettingsRef(this.uid),
-            snapshot => applyRealtimeSettingsSnapshot(snapshot),
+            snapshot => {
+              if (realtimeSyncManager !== manager || !this.active || realtimeSyncUid !== this.uid) return;
+              applyRealtimeSettingsSnapshot(snapshot);
+            },
             error => console.warn('Realtime settings listener failed:', error?.code || error?.message || error)
           )
         );
@@ -2343,9 +2368,17 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
     stopRealtimeSynchronization();
 
+    const manager = createRealtimeSynchronizationManager(normalizedUid);
+    realtimeSyncManager = manager;
     realtimeSyncUid = normalizedUid;
-    realtimeSyncManager = createRealtimeSynchronizationManager(normalizedUid);
-    realtimeSyncManager.start();
+    manager.start();
+
+    // Hard invariant: this page owns at most one active synchronization
+    // manager. The global reference must remain the manager that was just
+    // started; stale managers are stopped immediately.
+    if (realtimeSyncManager !== manager) {
+      manager.stop();
+    }
   }
 
   function safeClone(v) {
@@ -3141,9 +3174,11 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     }
   }
 
-  async function finishSignIn(user) {
+  async function finishSignIn(user, transitionToken = authTransitionToken) {
     const uid = String(user?.uid || '').trim();
     if (!uid) throw new Error('Firebase authentication did not provide a valid UID.');
+
+    if (transitionToken !== authTransitionToken) return;
 
     if (processedAuthUid === uid && authReady && sessionProfile) {
       setAuthStateView('ready', `Signed in as ${sessionProfile.name}.`, '', false);
@@ -3151,6 +3186,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     }
 
     const profile = await loadStaffProfile(user);
+    if (transitionToken !== authTransitionToken) return;
 
     sessionProfile = profile;
     processedAuthUid = uid;
@@ -3164,6 +3200,8 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       cloudPersistenceEnabled = false;
       console.warn('Firestore startup load failed; retaining local Phase 2 state:', error?.code || error?.message || error);
     }
+
+    if (transitionToken !== authTransitionToken) return;
 
     authReady = true;
 
@@ -3212,6 +3250,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   async function handleLogout() {
+    authTransitionToken++;
     stopRealtimeSynchronization();
     cloudPersistenceEnabled = false;
     clearTimeout(cloudSyncTimer);
@@ -3229,6 +3268,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   function initializeAuthGate() {
     prepareAuthScreen();
     onAuthStateChanged(auth, async (user) => {
+      const transitionToken = ++authTransitionToken;
       try {
         if (!user) {
           stopRealtimeSynchronization();
@@ -3246,8 +3286,9 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
         }
         authBusy = false;
         setAuthStateView('loading', 'Verifying staff profile...', '', true);
-        await finishSignIn(user);
+        await finishSignIn(user, transitionToken);
       } catch (error) {
+        if (transitionToken !== authTransitionToken) return;
         authBusy = false;
         authReady = false;
         sessionProfile = null;
