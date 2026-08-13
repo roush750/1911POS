@@ -1728,6 +1728,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   let cloudSyncTimer = null;
   let cloudSyncInFlight = false;
   let cloudSyncPending = false;
+  let cloudKnownRecordIds = new Map();
   let realtimeSyncManager = null;
   let realtimeSyncUid = null;
   let authTransitionToken = 0;
@@ -1955,61 +1956,80 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     return { ...cloud, hasBusinessRecords };
   }
 
-  function mergeRecordsPreservingLocal(localRecords, cloudRecords) {
-    const merged = new Map();
-    (cloudRecords || []).forEach(record => {
-      if (record?.id) merged.set(record.id, safeClone(record));
+  function resetCloudKnownRecordIds() {
+    cloudKnownRecordIds = new Map();
+    CLOUD_COLLECTIONS.forEach(name => cloudKnownRecordIds.set(name, new Set()));
+  }
+
+  function recordCloudKnownIds(cloud) {
+    resetCloudKnownRecordIds();
+    CLOUD_COLLECTIONS.forEach(name => {
+      const ids = cloudKnownRecordIds.get(name);
+      (cloud[name] || []).forEach(record => {
+        if (record?.id) ids.add(String(record.id));
+      });
     });
-    // When local Phase 2 state exists, preserve every local business record.
-    // Cloud-only records are added; an identical ID keeps the local version so
-    // hydration cannot silently overwrite a valid local record.
-    (localRecords || []).forEach(record => {
-      if (record?.id) merged.set(record.id, safeClone(record));
-    });
-    return [...merged.values()];
   }
 
   function applyCloudBusinessState(cloud) {
     const d = defaultState();
-    const useLocalRecords = localStateWasPresent;
+
+    // Once Firestore contains business records, it is the authoritative
+    // document set for this authenticated POS. Do not merge locally generated
+    // Phase-2 records into it: those records can have different IDs and would
+    // otherwise become duplicate Firestore documents on the next persistence.
     state.settings = cloud.settings
-      ? { ...d.settings, ...(cloud.settings.settings || cloud.settings), ...(useLocalRecords ? state.settings : {}) }
+      ? { ...d.settings, ...(cloud.settings.settings || cloud.settings) }
       : state.settings;
-    state.categories = useLocalRecords ? mergeRecordsPreservingLocal(state.categories, cloud.categories) : cloud.categories;
-    state.products = useLocalRecords ? mergeRecordsPreservingLocal(state.products, cloud.products) : cloud.products;
-    state.inventory = useLocalRecords ? mergeRecordsPreservingLocal(state.inventory, cloud.inventory) : cloud.inventory;
-    state.tables = useLocalRecords ? mergeRecordsPreservingLocal(state.tables, cloud.tables) : cloud.tables;
-    state.staff = useLocalRecords ? mergeRecordsPreservingLocal(state.staff, cloud.staff) : cloud.staff;
+    state.categories = (cloud.categories || []).map(record => ({ ...safeClone(record), id: String(record.id) }));
+    state.products = (cloud.products || []).map(record => ({ ...safeClone(record), id: String(record.id) }));
+    state.inventory = (cloud.inventory || []).map(record => ({ ...safeClone(record), id: String(record.id) }));
+    state.tables = (cloud.tables || []).map(record => ({ ...safeClone(record), id: String(record.id) }));
+    state.staff = (cloud.staff || []).map(record => ({ ...safeClone(record), id: String(record.id) }));
 
-    const cloudOrders = cloud.orders || [];
-    const localOrders = useLocalRecords ? [...(state.orders || []), ...(state.activeOrders || [])] : [];
-    const allOrders = useLocalRecords ? mergeRecordsPreservingLocal(localOrders, cloudOrders) : cloudOrders;
-    state.activeOrders = allOrders.filter(order => order && order.status !== 'paid' && order.paymentStatus !== 'paid');
-    state.orders = allOrders.filter(order => order && (order.status === 'paid' || order.paymentStatus === 'paid'));
+    const cloudOrders = (cloud.orders || []).map(record => ({ ...safeClone(record), id: String(record.id) }));
+    state.activeOrders = cloudOrders.filter(order => order && order.status !== 'paid' && order.paymentStatus !== 'paid');
+    state.orders = cloudOrders.filter(order => order && (order.status === 'paid' || order.paymentStatus === 'paid'));
 
-    const localOrderSequence = Number(state.orderSequence || 0);
     const cloudOrderSequence = Number(cloud.settings?.orderSequence || 0);
-    state.orderSequence = Math.max(localOrderSequence, cloudOrderSequence, 1);
+    state.orderSequence = Math.max(cloudOrderSequence, 1);
     state.currentOrderId = null;
     state.adminSelection = null;
     ensureCurrentStaff();
+    recordCloudKnownIds(cloud);
   }
 
   async function writeCloudBusinessState(uid, source = 'localStorage') {
     const business = businessStateForCloud();
     const writes = [];
+    const deletes = [];
+
     for (const name of CLOUD_COLLECTIONS) {
+      const currentIds = new Set();
       for (const record of business[name]) {
         if (!record?.id) continue;
-        writes.push([cloudDocRef(uid, name, record.id), record]);
+        const id = String(record.id);
+        currentIds.add(id);
+        // The application record ID is the Firestore document ID.
+        writes.push([cloudDocRef(uid, name, id), { ...safeClone(record), id }]);
       }
+      const knownIds = cloudKnownRecordIds.get(name) || new Set();
+      knownIds.forEach(id => {
+        if (!currentIds.has(id)) deletes.push([cloudDocRef(uid, name, id), name, id]);
+      });
     }
+
     const chunkSize = 450;
-    for (let i = 0; i < writes.length; i += chunkSize) {
+    const operations = [...writes.map(([ref, record]) => ({ type: 'set', ref, record })), ...deletes.map(([ref, name, id]) => ({ type: 'delete', ref, name, id }))];
+    for (let i = 0; i < operations.length; i += chunkSize) {
       const batch = writeBatch(db);
-      writes.slice(i, i + chunkSize).forEach(([ref, record]) => batch.set(ref, record));
+      operations.slice(i, i + chunkSize).forEach(op => {
+        if (op.type === 'set') batch.set(op.ref, op.record);
+        else batch.delete(op.ref);
+      });
       await batch.commit();
     }
+
     await setDoc(cloudSettingsRef(uid), {
       settings: business.settings,
       orderSequence: business.orderSequence,
@@ -2022,6 +2042,14 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       migratedAt: Date.now(),
       counts: Object.fromEntries(CLOUD_COLLECTIONS.map(name => [name, business[name].length]))
     }, { merge: true });
+
+    CLOUD_COLLECTIONS.forEach(name => {
+      const ids = new Set();
+      business[name].forEach(record => {
+        if (record?.id) ids.add(String(record.id));
+      });
+      cloudKnownRecordIds.set(name, ids);
+    });
   }
 
   function scheduleCloudPersistence() {
@@ -2223,6 +2251,13 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
         state.currentStaffId = state.staff[0]?.id || null;
       }
     }
+
+    const knownIds = cloudKnownRecordIds.get(collectionName) || new Set();
+    snapshot.docs.forEach(docSnap => knownIds.add(String(docSnap.id)));
+    snapshot.docChanges().forEach(change => {
+      if (change.type === 'removed') knownIds.delete(String(change.doc.id));
+    });
+    cloudKnownRecordIds.set(collectionName, knownIds);
 
     writeLocalStateOnly();
     renderRealtimeAffected(collectionName);
