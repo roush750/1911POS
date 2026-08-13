@@ -1888,9 +1888,34 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     } catch (e) {
       console.warn('localStorage save failed:', e);
     }
+
+    // saveState() is intentionally local-first. Only schedule cloud work when
+    // cloud-backed business data actually changed. UI/navigation state changes
+    // (search, modal context, selected category, etc.) must not start a cloud
+    // persistence pass.
     if (cloudPersistenceEnabled && !cloudHydrationInProgress) {
-      scheduleCloudPersistence();
+      const currentBusinessSnapshot = businessSnapshotForDiff(businessStateForCloud());
+      // Compare against the last successfully synchronized cloud baseline, not
+      // merely the previous local save. If a cloud write failed, the difference
+      // remains visible here and the next save/retry will continue to schedule
+      // persistence rather than silently considering the data synchronized.
+      const cloudNeedsUpdate = !cloudSyncBaseline || !businessSnapshotsEqual(cloudSyncBaseline, currentBusinessSnapshot);
+      if (cloudNeedsUpdate) scheduleCloudPersistence();
     }
+  }
+
+  function businessSnapshotsEqual(a, b) {
+    if (!a || !b) return false;
+    if (a.settings !== b.settings || a.orderSequence !== b.orderSequence) return false;
+    for (const name of CLOUD_COLLECTIONS) {
+      const am = a[name] || new Map();
+      const bm = b[name] || new Map();
+      if (am.size !== bm.size) return false;
+      for (const [id, value] of am) {
+        if (bm.get(id) !== value) return false;
+      }
+    }
+    return true;
   }
 
   const CLOUD_COLLECTIONS = ['categories', 'products', 'inventory', 'orders', 'tables', 'staff'];
@@ -3018,7 +3043,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     renderOrderPanel();
     renderHistory();
     renderQuickReports();
-    saveState();
   }
 
   function renderHeaderState() {
@@ -3637,42 +3661,65 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   function finalizeOrder(orderId, paymentMethod, cashReceived, closeTableAfterPayment = true) {
     const order = getOrderById(orderId);
     if (!order) return;
-    if (order.status === 'paid') {
+    if (order.status === 'paid' || order.paymentStatus === 'paid') {
       toast('This order has already been paid.');
       closeModal();
+      renderAll();
       return;
     }
-    recalcOrder(order);
 
+    // Complete the entire business-state transition in memory first. No render
+    // or cloud persistence occurs until the canonical state is internally
+    // consistent. This prevents a partially-completed order from being saved.
+    recalcOrder(order);
     const stockWarnings = deductInventory(order);
+
     order.status = 'paid';
     order.paymentStatus = 'paid';
     order.paymentMethod = paymentMethod;
     order.cashReceived = Number(cashReceived || 0);
-    order.changeDue = paymentMethod === 'Cash' ? Math.max(0, order.cashReceived - order.total) : 0;
+    order.changeDue = paymentMethod === 'Cash'
+      ? Math.max(0, order.cashReceived - order.total)
+      : 0;
     order.staffPaidId = state.currentStaffId;
     order.staffPaidName = getCurrentStaff()?.name || '—';
     order.paidAt = Date.now();
     order.updatedAt = Date.now();
 
-    // move from active orders to completed
     state.activeOrders = state.activeOrders.filter(o => o.id !== order.id);
-    state.orders.unshift(safeClone(order));
+
+    // Preserve one logical order record: the same application ID becomes the
+    // completed/history record rather than creating a second order ID.
+    const completedOrder = safeClone(order);
+    state.orders = [completedOrder, ...(state.orders || []).filter(o => o.id !== order.id)];
 
     const table = order.tableId ? getTableById(order.tableId) : null;
-    if (table && closeTableAfterPayment) {
-      table.orderId = null;
-      table.lastClosedAt = Date.now();
-    } else if (table) {
+    if (table) {
+      // Payment always releases the table in the existing Phase 3 behavior.
       table.orderId = null;
       table.lastClosedAt = Date.now();
     }
 
     state.currentOrderId = state.activeOrders[0]?.id || null;
+    state.checkoutDraft = null;
+
+    // One local save for the complete state transition. Cloud persistence is
+    // asynchronous and never blocks completion.
     saveState();
-    renderAll();
+
+    // Close the checkout UI first, then render from the now-canonical state so
+    // tables, active orders, history, revenue, and reports update immediately.
     closeModal();
-    toast(stockWarnings.length ? `Payment completed. Stock warnings: ${stockWarnings.join(', ')}` : 'Payment completed.');
+    state.modalContext = null;
+    state.activeTableFlowId = null;
+    state.pendingTableId = null;
+    state.flowStage = 'order';
+    state.orderEditMode = false;
+    renderAll();
+
+    toast(stockWarnings.length
+      ? `Payment completed. Stock warnings: ${stockWarnings.join(', ')}`
+      : 'Payment completed.');
   }
 
   function deductInventory(order) {
@@ -3703,7 +3750,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
         }
       });
     });
-    saveState();
     return [...new Set([...warnings, ...unitWarnings])];
   }
 
@@ -5006,13 +5052,13 @@ function quickSwitchStaff(id) {
     }
   }
 
-  function closeModal() {
+  function closeModal(persistLocalState = false) {
     $('modal').classList.remove('open');
     $('modalBody').innerHTML = '';
     $('modalTitle').textContent = 'Modal';
     $('modalSubtitle').textContent = '';
     state.checkoutDraft = null;
-    saveState();
+    if (persistLocalState) saveState();
   }
 
   function toast(message) {
