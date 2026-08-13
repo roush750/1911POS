@@ -1729,6 +1729,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   let cloudSyncTimer = null;
   let cloudSyncInFlight = false;
   let cloudSyncPending = false;
+  let cloudSyncBaseline = null;
 
   const defaultState = () => ({
     settings: {
@@ -1933,6 +1934,14 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     };
   }
 
+  function jsonEqual(a, b) {
+    try {
+      return JSON.stringify(a) === JSON.stringify(b);
+    } catch (e) {
+      return false;
+    }
+  }
+
   async function readCloudBusinessState(uid) {
     const results = await Promise.all([
       ...CLOUD_COLLECTIONS.map(name => getDocs(cloudCollectionRef(uid, name))),
@@ -1953,9 +1962,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     (cloudRecords || []).forEach(record => {
       if (record?.id) merged.set(record.id, safeClone(record));
     });
-    // When local Phase 2 state exists, preserve every local business record.
-    // Cloud-only records are added; an identical ID keeps the local version so
-    // hydration cannot silently overwrite a valid local record.
     (localRecords || []).forEach(record => {
       if (record?.id) merged.set(record.id, safeClone(record));
     });
@@ -2015,6 +2021,46 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       migratedAt: Date.now(),
       counts: Object.fromEntries(CLOUD_COLLECTIONS.map(name => [name, business[name].length]))
     }, { merge: true });
+    cloudSyncBaseline = safeClone(business);
+  }
+
+  async function writeChangedCloudBusinessState(uid) {
+    const business = businessStateForCloud();
+    const baseline = cloudSyncBaseline || { categories: [], products: [], inventory: [], orders: [], tables: [], staff: [], settings: {}, orderSequence: 1 };
+    const writes = [];
+
+    for (const name of CLOUD_COLLECTIONS) {
+      const previousById = new Map((baseline[name] || []).filter(r => r?.id).map(r => [r.id, r]));
+      for (const record of business[name]) {
+        if (!record?.id) continue;
+        const previous = previousById.get(record.id);
+        if (!previous || !jsonEqual(previous, record)) {
+          writes.push([cloudDocRef(uid, name, record.id), record]);
+        }
+      }
+    }
+
+    const settingsChanged = !jsonEqual(baseline.settings || {}, business.settings || {});
+    const orderSequenceChanged = Number(baseline.orderSequence || 1) !== Number(business.orderSequence || 1);
+
+    if (writes.length) {
+      const chunkSize = 450;
+      for (let i = 0; i < writes.length; i += chunkSize) {
+        const batch = writeBatch(db);
+        writes.slice(i, i + chunkSize).forEach(([ref, record]) => batch.set(ref, record));
+        await batch.commit();
+      }
+    }
+
+    if (settingsChanged || orderSequenceChanged) {
+      await setDoc(cloudSettingsRef(uid), {
+        settings: business.settings,
+        orderSequence: business.orderSequence,
+        updatedAt: Date.now()
+      }, { merge: true });
+    }
+
+    cloudSyncBaseline = safeClone(business);
   }
 
   function scheduleCloudPersistence() {
@@ -2030,10 +2076,17 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       cloudSyncPending = true;
       return;
     }
+
+    const business = businessStateForCloud();
+    if (cloudSyncBaseline && jsonEqual(cloudSyncBaseline, business)) {
+      cloudSyncPending = false;
+      return;
+    }
+
     cloudSyncInFlight = true;
     cloudSyncPending = false;
     try {
-      await writeCloudBusinessState(sessionProfile.uid, localStateWasPresent ? 'localStorage' : 'application');
+      await writeChangedCloudBusinessState(sessionProfile.uid);
     } catch (error) {
       console.warn('Firestore persistence failed:', error?.code || error?.message || error);
     } finally {
@@ -2046,22 +2099,25 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     cloudHydrationInProgress = true;
     cloudPersistenceEnabled = false;
     try {
+      // A normal browser already has its verified local Phase 3 business state.
+      // Re-reading all business collections on every startup only duplicates
+      // work and can reintroduce local/cloud merge duplication. Fresh browsers
+      // still perform the full hydration pass.
+      if (localStateWasPresent) {
+        cloudPersistenceEnabled = true;
+        cloudSyncBaseline = businessStateForCloud();
+        return { mode: 'local', hasBusinessRecords: false };
+      }
+
       const cloud = await readCloudBusinessState(uid);
       if (cloud.hasBusinessRecords) {
         applyCloudBusinessState(cloud);
+        cloudSyncBaseline = businessStateForCloud();
         saveState();
         cloudPersistenceEnabled = true;
         return { mode: 'hydrated', hasBusinessRecords: true };
       }
 
-      if (localStateWasPresent) {
-        await writeCloudBusinessState(uid, 'localStorage');
-        cloudPersistenceEnabled = true;
-        return { mode: 'migrated', hasBusinessRecords: false };
-      }
-
-      // Fresh browser with no local state and no cloud records: keep the normal
-      // Phase 2 defaults and persist them once authentication is authorized.
       await writeCloudBusinessState(uid, 'defaultState');
       cloudPersistenceEnabled = true;
       return { mode: 'initialized', hasBusinessRecords: false };
