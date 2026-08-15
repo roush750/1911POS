@@ -1729,6 +1729,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   let cloudSyncInFlight = false;
   let cloudSyncPending = false;
   let cloudKnownRecordIds = new Map();
+  let cloudSyncedBusinessState = null;
   let realtimeSyncManager = null;
   let realtimeSyncUid = null;
   let authTransitionToken = 0;
@@ -1999,57 +2000,176 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     recordCloudKnownIds(cloud);
   }
 
-  async function writeCloudBusinessState(uid, source = 'localStorage') {
-    const business = businessStateForCloud();
+  function cloneCloudBusinessState(business) {
+    return safeClone(business || {
+      categories: [],
+      products: [],
+      inventory: [],
+      orders: [],
+      tables: [],
+      staff: [],
+      settings: {},
+      orderSequence: 1
+    });
+  }
+
+  function indexBusinessRecords(records) {
+    const map = new Map();
+    (records || []).forEach(record => {
+      if (record?.id) map.set(String(record.id), safeClone(record));
+    });
+    return map;
+  }
+
+  function buildDirtyDocumentOperations(previousBusiness, currentBusiness) {
     const writes = [];
     const deletes = [];
+    const dirty = {
+      categories: new Set(),
+      products: new Set(),
+      inventory: new Set(),
+      orders: new Set(),
+      tables: new Set(),
+      staff: new Set(),
+      settings: false
+    };
 
     for (const name of CLOUD_COLLECTIONS) {
-      const currentIds = new Set();
-      for (const record of business[name]) {
-        if (!record?.id) continue;
-        const id = String(record.id);
-        currentIds.add(id);
-        // The application record ID is the Firestore document ID.
-        writes.push([cloudDocRef(uid, name, id), { ...safeClone(record), id }]);
-      }
-      const knownIds = cloudKnownRecordIds.get(name) || new Set();
-      knownIds.forEach(id => {
-        if (!currentIds.has(id)) deletes.push([cloudDocRef(uid, name, id), name, id]);
+      const previous = indexBusinessRecords(previousBusiness?.[name]);
+      const current = indexBusinessRecords(currentBusiness?.[name]);
+
+      current.forEach((record, id) => {
+        const before = previous.get(id);
+        if (!before || JSON.stringify(before) !== JSON.stringify(record)) {
+          dirty[name].add(id);
+          writes.push({
+            type: 'set',
+            name,
+            id,
+            ref: cloudDocRef(sessionProfile.uid, name, id),
+            record
+          });
+        }
+      });
+
+      previous.forEach((_record, id) => {
+        if (!current.has(id)) {
+          dirty[name].add(id);
+          deletes.push({
+            type: 'delete',
+            name,
+            id,
+            ref: cloudDocRef(sessionProfile.uid, name, id)
+          });
+        }
       });
     }
 
-    const chunkSize = 450;
-    const operations = [...writes.map(([ref, record]) => ({ type: 'set', ref, record })), ...deletes.map(([ref, name, id]) => ({ type: 'delete', ref, name, id }))];
-    for (let i = 0; i < operations.length; i += chunkSize) {
-      const batch = writeBatch(db);
-      operations.slice(i, i + chunkSize).forEach(op => {
-        if (op.type === 'set') batch.set(op.ref, op.record);
-        else batch.delete(op.ref);
-      });
-      await batch.commit();
-    }
-
-    await setDoc(cloudSettingsRef(uid), {
-      settings: business.settings,
-      orderSequence: business.orderSequence,
-      updatedAt: Date.now()
-    }, { merge: true });
-    await setDoc(cloudMigrationRef(uid), {
-      status: 'completed',
-      informationalOnly: true,
-      source,
-      migratedAt: Date.now(),
-      counts: Object.fromEntries(CLOUD_COLLECTIONS.map(name => [name, business[name].length]))
-    }, { merge: true });
-
-    CLOUD_COLLECTIONS.forEach(name => {
-      const ids = new Set();
-      business[name].forEach(record => {
-        if (record?.id) ids.add(String(record.id));
-      });
-      cloudKnownRecordIds.set(name, ids);
+    const previousSettings = JSON.stringify({
+      settings: previousBusiness?.settings || {},
+      orderSequence: Number(previousBusiness?.orderSequence || 1)
     });
+    const currentSettings = JSON.stringify({
+      settings: currentBusiness?.settings || {},
+      orderSequence: Number(currentBusiness?.orderSequence || 1)
+    });
+    dirty.settings = previousSettings !== currentSettings;
+
+    return { writes, deletes, dirty };
+  }
+
+  function setCloudSyncedBusinessState(business) {
+    cloudSyncedBusinessState = cloneCloudBusinessState(business);
+    recordCloudKnownIds(cloudSyncedBusinessState);
+  }
+
+  function dirtySummary(dirty) {
+    return {
+      categories: dirty.categories.size,
+      products: dirty.products.size,
+      inventory: dirty.inventory.size,
+      orders: dirty.orders.size,
+      tables: dirty.tables.size,
+      staff: dirty.staff.size,
+      settings: dirty.settings ? 1 : 0
+    };
+  }
+
+  async function writeCloudBusinessState(uid, source = 'localStorage', fullSync = false) {
+    const business = businessStateForCloud();
+    const hadSyncedBaseline = Boolean(cloudSyncedBusinessState);
+    const baseline = fullSync || !hadSyncedBaseline
+      ? {
+          categories: [],
+          products: [],
+          inventory: [],
+          orders: [],
+          tables: [],
+          staff: [],
+          settings: {},
+          orderSequence: 0
+        }
+      : cloudSyncedBusinessState;
+
+    // Phase 4.5: compare the current business state against the last state
+    // successfully written by this authenticated client. Only changed or
+    // deleted Firestore documents become dirty operations.
+    const { writes, deletes, dirty } = buildDirtyDocumentOperations(baseline, business);
+    const operations = [...writes, ...deletes];
+
+    if (operations.length) {
+      const chunkSize = 450;
+      for (let i = 0; i < operations.length; i += chunkSize) {
+        const batch = writeBatch(db);
+        operations.slice(i, i + chunkSize).forEach(op => {
+          if (op.type === 'set') batch.set(op.ref, op.record);
+          else batch.delete(op.ref);
+        });
+        await batch.commit();
+      }
+    }
+
+    const baselineSettings = JSON.stringify({
+      settings: baseline?.settings || {},
+      orderSequence: Number(baseline?.orderSequence || 0)
+    });
+    const currentSettings = JSON.stringify({
+      settings: business.settings || {},
+      orderSequence: Number(business.orderSequence || 1)
+    });
+    const settingsChanged = baselineSettings !== currentSettings;
+
+    if (settingsChanged) {
+      await setDoc(cloudSettingsRef(uid), {
+        settings: business.settings,
+        orderSequence: business.orderSequence,
+        updatedAt: Date.now()
+      }, { merge: true });
+    }
+
+    // meta/migration is migration metadata, not normal business mutation
+    // state. Preserve it for migration/bootstrap writes, but never rewrite it
+    // merely because a product/order/table/etc. changed.
+    if (fullSync || (source === 'localStorage' && !hadSyncedBaseline)) {
+      await setDoc(cloudMigrationRef(uid), {
+        status: 'completed',
+        informationalOnly: true,
+        source,
+        migratedAt: Date.now(),
+        counts: Object.fromEntries(CLOUD_COLLECTIONS.map(name => [name, business[name].length]))
+      }, { merge: true });
+    }
+
+    setCloudSyncedBusinessState(business);
+
+    return {
+      writes: writes.length,
+      deletes: deletes.length,
+      settingsWrites: settingsChanged ? 1 : 0,
+      migrationWrites: (fullSync || (source === 'localStorage' && !hadSyncedBaseline)) ? 1 : 0,
+      dirty: dirtySummary(dirty),
+      business
+    };
   }
 
   function scheduleCloudPersistence() {
@@ -2084,20 +2204,21 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       const cloud = await readCloudBusinessState(uid);
       if (cloud.hasBusinessRecords) {
         applyCloudBusinessState(cloud);
+        setCloudSyncedBusinessState(businessStateForCloud());
         saveState();
         cloudPersistenceEnabled = true;
         return { mode: 'hydrated', hasBusinessRecords: true };
       }
 
       if (localStateWasPresent) {
-        await writeCloudBusinessState(uid, 'localStorage');
+        await writeCloudBusinessState(uid, 'localStorage', true);
         cloudPersistenceEnabled = true;
         return { mode: 'migrated', hasBusinessRecords: false };
       }
 
       // Fresh browser with no local state and no cloud records: keep the normal
       // Phase 2 defaults and persist them once authentication is authorized.
-      await writeCloudBusinessState(uid, 'defaultState');
+      await writeCloudBusinessState(uid, 'defaultState', true);
       cloudPersistenceEnabled = true;
       return { mode: 'initialized', hasBusinessRecords: false };
     } finally {
@@ -2260,6 +2381,13 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     cloudKnownRecordIds.set(collectionName, knownIds);
 
     writeLocalStateOnly();
+    // A remote snapshot is already authoritative in Firestore. When there is
+    // no local persistence currently pending, advance the local cloud baseline
+    // so a later unrelated mutation does not rewrite this remotely changed
+    // document merely because the baseline was stale.
+    if (!cloudSyncInFlight && !cloudSyncPending && !cloudHydrationInProgress) {
+      setCloudSyncedBusinessState(businessStateForCloud());
+    }
     renderRealtimeAffected(collectionName);
   }
 
@@ -2282,6 +2410,9 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     }
 
     writeLocalStateOnly();
+    if (!cloudSyncInFlight && !cloudSyncPending && !cloudHydrationInProgress) {
+      setCloudSyncedBusinessState(businessStateForCloud());
+    }
     renderRealtimeAffected('settings');
   }
 
