@@ -2679,6 +2679,18 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     return String(getCurrentStaff()?.role || '').toUpperCase() === 'OWNER';
   }
 
+  function requireOwner(action = 'perform this action') {
+    if (!authReady || !sessionProfile) {
+      toast('Authentication is required.');
+      return false;
+    }
+    if (String(sessionProfile.role || '').toUpperCase() !== 'OWNER') {
+      toast(`Owner access is required to ${action}.`);
+      return false;
+    }
+    return true;
+  }
+
   function formatMoney(value) {
     return `${Math.max(0, Math.round(Number(value) || 0)).toLocaleString()} ${state.settings.currency}`;
   }
@@ -4547,6 +4559,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function saveProduct() {
+    if (!requireOwner('modify products')) return;
     const name = $('p_name').value.trim();
     if (!name) return toast('Product name is required.');
     const price = Number($('p_price').value || 0);
@@ -4608,6 +4621,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function deleteProduct(id) {
+    if (!requireOwner('delete products')) return;
     const product = getProductById(id);
     if (!product) return;
     if (!confirm(`Delete product "${product.name}"?`)) return;
@@ -4621,6 +4635,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function moveProduct(id, dir) {
+    if (!requireOwner('reorder products')) return;
     const idx = state.products.findIndex(p => p.id === id);
     if (idx < 0) return;
     const next = idx + dir;
@@ -4720,6 +4735,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function saveCategory() {
+    if (!requireOwner('modify categories')) return;
     const name = $('c_name').value.trim();
     if (!name) return toast('Category name is required.');
     const order = Number($('c_order').value || state.categories.length + 1);
@@ -4740,6 +4756,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function moveCategory(id, dir) {
+    if (!requireOwner('reorder categories')) return;
     const idx = state.categories.findIndex(c => c.id === id);
     const next = idx + dir;
     if (idx < 0 || next < 0 || next >= state.categories.length) return;
@@ -4752,6 +4769,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function deleteCategory(id) {
+    if (!requireOwner('delete categories')) return;
     const cat = state.categories.find(c => c.id === id);
     if (!cat) return;
     if (state.products.some(p => p.categoryId === id)) {
@@ -4820,6 +4838,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
 
   function addTable() {
+    if (!requireOwner('create tables')) return;
     state.adminSelection = null;
     renderAdmin();
   }
@@ -4830,6 +4849,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function saveTable() {
+    if (!requireOwner('modify tables')) return;
     const label = $('t_label').value.trim();
     if (!label) return toast('Table name is required.');
     if (state.adminSelection) {
@@ -4860,6 +4880,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
 
   function deleteTable(id) {
+    if (!requireOwner('delete tables')) return;
     const t = getTableById(id);
     if (!t) return;
 
@@ -4992,6 +5013,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   function newInventory() { state.adminSelection = null; renderAdmin(); }
   function editInventory(id) { state.adminSelection = id; renderAdmin(); }
   function saveInventory() {
+    if (!requireOwner('modify inventory')) return;
     const name = $('inv_name').value.trim();
     if (!name) return toast('Inventory name is required.');
     const payload = {
@@ -5017,6 +5039,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     toast('Inventory saved.');
   }
   function deleteInventory(id) {
+    if (!requireOwner('delete inventory')) return;
     const inv = getInventoryById(id);
     if (!inv) return;
     if (state.products.some(p => (p.recipe || []).some(r => r.inventoryId === id))) {
@@ -5259,6 +5282,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   function newStaff() { state.adminSelection = null; renderAdmin(); }
   function editStaff(id) { state.adminSelection = id; renderAdmin(); }
   function saveStaff() {
+    if (!requireOwner('modify staff')) return;
     const name = $('s_name').value.trim();
     const pin = $('s_pin').value.trim();
     const role = $('s_role').value;
@@ -5280,6 +5304,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function deleteStaff(id) {
+    if (!requireOwner('delete staff')) return;
     const st = state.staff.find(s => s.id === id);
     if (!st) return;
     if (state.staff.length === 1) return toast('At least one staff member is required.');
@@ -5452,6 +5477,7 @@ function quickSwitchStaff(id) {
 
 
   function saveSettings() {
+    if (!requireOwner('modify settings')) return;
     state.settings.brandName = $('set_brand').value.trim() || '1911';
     state.settings.tableCount = state.tables.length;
     state.settings.currency = $('set_currency').value.trim() || 'IQD';
