@@ -1894,35 +1894,37 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   // Explicit persistence trigger for genuine business-data mutations only.
   // UI-only/local state changes continue through saveState() without a cloud write.
   function persistBusinessMutation() {
-    if (cloudPersistenceEnabled && !cloudHydrationInProgress && sessionProfile?.uid) {
+    if (cloudPersistenceEnabled && !cloudHydrationInProgress && sessionProfile?.businessId) {
       scheduleCloudPersistence();
     }
   }
 
   const CLOUD_COLLECTIONS = ['categories', 'products', 'inventory', 'orders', 'tables', 'staff'];
 
-  function cloudNamespace(uid) {
-    return ['1911POS', String(uid)];
+  function cloudNamespace(businessId) {
+    const normalizedBusinessId = String(businessId || '').trim();
+    if (!normalizedBusinessId) throw new Error('1911 POS businessId is missing.');
+    return ['1911POS', normalizedBusinessId];
   }
 
-  function cloudCollectionRef(uid, name) {
-    const [root, userId] = cloudNamespace(uid);
-    return collection(db, root, userId, name);
+  function cloudCollectionRef(businessId, name) {
+    const [root, businessKey] = cloudNamespace(businessId);
+    return collection(db, root, businessKey, name);
   }
 
-  function cloudDocRef(uid, name, id) {
-    const [root, userId] = cloudNamespace(uid);
-    return doc(db, root, userId, name, String(id));
+  function cloudDocRef(businessId, name, id) {
+    const [root, businessKey] = cloudNamespace(businessId);
+    return doc(db, root, businessKey, name, String(id));
   }
 
-  function cloudSettingsRef(uid) {
-    const [root, userId] = cloudNamespace(uid);
-    return doc(db, root, userId, 'settings', 'main');
+  function cloudSettingsRef(businessId) {
+    const [root, businessKey] = cloudNamespace(businessId);
+    return doc(db, root, businessKey, 'settings', 'main');
   }
 
-  function cloudMigrationRef(uid) {
-    const [root, userId] = cloudNamespace(uid);
-    return doc(db, root, userId, 'meta', 'migration');
+  function cloudMigrationRef(businessId) {
+    const [root, businessKey] = cloudNamespace(businessId);
+    return doc(db, root, businessKey, 'meta', 'migration');
   }
 
   function businessStateForCloud() {
@@ -1942,10 +1944,10 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     };
   }
 
-  async function readCloudBusinessState(uid) {
+  async function readCloudBusinessState(businessId) {
     const results = await Promise.all([
-      ...CLOUD_COLLECTIONS.map(name => getDocs(cloudCollectionRef(uid, name))),
-      getDoc(cloudSettingsRef(uid))
+      ...CLOUD_COLLECTIONS.map(name => getDocs(cloudCollectionRef(businessId, name))),
+      getDoc(cloudSettingsRef(businessId))
     ]);
     const cloud = { categories: [], products: [], inventory: [], orders: [], tables: [], staff: [], settings: null };
     CLOUD_COLLECTIONS.forEach((name, index) => {
@@ -2046,7 +2048,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
             type: 'set',
             name,
             id,
-            ref: cloudDocRef(sessionProfile.uid, name, id),
+            ref: cloudDocRef(sessionProfile.businessId, name, id),
             record
           });
         }
@@ -2059,7 +2061,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
             type: 'delete',
             name,
             id,
-            ref: cloudDocRef(sessionProfile.uid, name, id)
+            ref: cloudDocRef(sessionProfile.businessId, name, id)
           });
         }
       });
@@ -2095,7 +2097,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     };
   }
 
-  async function writeCloudBusinessState(uid, source = 'localStorage', fullSync = false) {
+  async function writeCloudBusinessState(businessId, source = 'localStorage', fullSync = false) {
     const business = businessStateForCloud();
     const hadSyncedBaseline = Boolean(cloudSyncedBusinessState);
     const baseline = fullSync || !hadSyncedBaseline
@@ -2140,7 +2142,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     const settingsChanged = baselineSettings !== currentSettings;
 
     if (settingsChanged) {
-      await setDoc(cloudSettingsRef(uid), {
+      await setDoc(cloudSettingsRef(businessId), {
         settings: business.settings,
         orderSequence: business.orderSequence,
         updatedAt: Date.now()
@@ -2151,7 +2153,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     // state. Preserve it for migration/bootstrap writes, but never rewrite it
     // merely because a product/order/table/etc. changed.
     if (fullSync || (source === 'localStorage' && !hadSyncedBaseline)) {
-      await setDoc(cloudMigrationRef(uid), {
+      await setDoc(cloudMigrationRef(businessId), {
         status: 'completed',
         informationalOnly: true,
         source,
@@ -2173,14 +2175,14 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function scheduleCloudPersistence() {
-    if (!cloudPersistenceEnabled || cloudHydrationInProgress || !sessionProfile?.uid) return;
+    if (!cloudPersistenceEnabled || cloudHydrationInProgress || !sessionProfile?.businessId) return;
     cloudSyncPending = true;
     clearTimeout(cloudSyncTimer);
     cloudSyncTimer = setTimeout(() => { persistCurrentStateToCloud().catch(() => {}); }, 350);
   }
 
   async function persistCurrentStateToCloud() {
-    if (!cloudPersistenceEnabled || cloudHydrationInProgress || !sessionProfile?.uid) return;
+    if (!cloudPersistenceEnabled || cloudHydrationInProgress || !sessionProfile?.businessId) return;
     if (cloudSyncInFlight) {
       cloudSyncPending = true;
       return;
@@ -2188,7 +2190,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     cloudSyncInFlight = true;
     cloudSyncPending = false;
     try {
-      await writeCloudBusinessState(sessionProfile.uid, localStateWasPresent ? 'localStorage' : 'application');
+      await writeCloudBusinessState(sessionProfile.businessId, localStateWasPresent ? 'localStorage' : 'application');
     } catch (error) {
       console.warn('Firestore persistence failed:', error?.code || error?.message || error);
     } finally {
@@ -2197,11 +2199,11 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     }
   }
 
-  async function hydrateOrMigrateCloudState(uid) {
+  async function hydrateOrMigrateCloudState(businessId) {
     cloudHydrationInProgress = true;
     cloudPersistenceEnabled = false;
     try {
-      const cloud = await readCloudBusinessState(uid);
+      const cloud = await readCloudBusinessState(businessId);
       if (cloud.hasBusinessRecords) {
         applyCloudBusinessState(cloud);
         setCloudSyncedBusinessState(businessStateForCloud());
@@ -2210,17 +2212,14 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
         return { mode: 'hydrated', hasBusinessRecords: true };
       }
 
-      if (localStateWasPresent) {
-        await writeCloudBusinessState(uid, 'localStorage', true);
-        cloudPersistenceEnabled = true;
-        return { mode: 'migrated', hasBusinessRecords: false };
-      }
-
-      // Fresh browser with no local state and no cloud records: keep the normal
-      // Phase 2 defaults and persist them once authentication is authorized.
-      await writeCloudBusinessState(uid, 'defaultState', true);
-      cloudPersistenceEnabled = true;
-      return { mode: 'initialized', hasBusinessRecords: false };
+      // The shared business namespace is intentionally not bootstrapped in
+      // this step. Existing UID-scoped localStorage may belong to the old
+      // architecture and must never be silently uploaded into the new
+      // business namespace. Migration/bootstrap is a separate approved step.
+      throw Object.assign(
+        new Error(`Shared business namespace 1911POS/${businessId} is not initialized. Existing local data was not migrated or uploaded.`),
+        { code: 'business/shared-namespace-not-initialized', businessId }
+      );
     } finally {
       cloudHydrationInProgress = false;
     }
@@ -2416,9 +2415,9 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     renderRealtimeAffected('settings');
   }
 
-  function createRealtimeSynchronizationManager(uid) {
+  function createRealtimeSynchronizationManager(businessId) {
     const manager = {
-      uid: String(uid),
+      businessId: String(businessId),
       active: false,
       unsubscribe: [],
 
@@ -2428,9 +2427,9 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
         this.unsubscribe.push(
           onSnapshot(
-            cloudCollectionRef(this.uid, 'categories'),
+            cloudCollectionRef(this.businessId, 'categories'),
             snapshot => {
-              if (realtimeSyncManager !== manager || !this.active || realtimeSyncUid !== this.uid) return;
+              if (realtimeSyncManager !== manager || !this.active || realtimeSyncUid !== this.businessId) return;
               applyRealtimeCollectionSnapshot('categories', snapshot);
             },
             error => console.warn('Realtime categories listener failed:', error?.code || error?.message || error)
@@ -2439,9 +2438,9 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
         this.unsubscribe.push(
           onSnapshot(
-            cloudCollectionRef(this.uid, 'products'),
+            cloudCollectionRef(this.businessId, 'products'),
             snapshot => {
-              if (realtimeSyncManager !== manager || !this.active || realtimeSyncUid !== this.uid) return;
+              if (realtimeSyncManager !== manager || !this.active || realtimeSyncUid !== this.businessId) return;
               applyRealtimeCollectionSnapshot('products', snapshot);
             },
             error => console.warn('Realtime products listener failed:', error?.code || error?.message || error)
@@ -2450,9 +2449,9 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
         this.unsubscribe.push(
           onSnapshot(
-            cloudCollectionRef(this.uid, 'inventory'),
+            cloudCollectionRef(this.businessId, 'inventory'),
             snapshot => {
-              if (realtimeSyncManager !== manager || !this.active || realtimeSyncUid !== this.uid) return;
+              if (realtimeSyncManager !== manager || !this.active || realtimeSyncUid !== this.businessId) return;
               applyRealtimeCollectionSnapshot('inventory', snapshot);
             },
             error => console.warn('Realtime inventory listener failed:', error?.code || error?.message || error)
@@ -2461,9 +2460,9 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
         this.unsubscribe.push(
           onSnapshot(
-            cloudCollectionRef(this.uid, 'orders'),
+            cloudCollectionRef(this.businessId, 'orders'),
             snapshot => {
-              if (realtimeSyncManager !== manager || !this.active || realtimeSyncUid !== this.uid) return;
+              if (realtimeSyncManager !== manager || !this.active || realtimeSyncUid !== this.businessId) return;
               applyRealtimeCollectionSnapshot('orders', snapshot);
             },
             error => console.warn('Realtime orders listener failed:', error?.code || error?.message || error)
@@ -2472,9 +2471,9 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
         this.unsubscribe.push(
           onSnapshot(
-            cloudCollectionRef(this.uid, 'tables'),
+            cloudCollectionRef(this.businessId, 'tables'),
             snapshot => {
-              if (realtimeSyncManager !== manager || !this.active || realtimeSyncUid !== this.uid) return;
+              if (realtimeSyncManager !== manager || !this.active || realtimeSyncUid !== this.businessId) return;
               applyRealtimeCollectionSnapshot('tables', snapshot);
             },
             error => console.warn('Realtime tables listener failed:', error?.code || error?.message || error)
@@ -2483,9 +2482,9 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
         this.unsubscribe.push(
           onSnapshot(
-            cloudCollectionRef(this.uid, 'staff'),
+            cloudCollectionRef(this.businessId, 'staff'),
             snapshot => {
-              if (realtimeSyncManager !== manager || !this.active || realtimeSyncUid !== this.uid) return;
+              if (realtimeSyncManager !== manager || !this.active || realtimeSyncUid !== this.businessId) return;
               applyRealtimeCollectionSnapshot('staff', snapshot);
             },
             error => console.warn('Realtime staff listener failed:', error?.code || error?.message || error)
@@ -2494,9 +2493,9 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
         this.unsubscribe.push(
           onSnapshot(
-            cloudSettingsRef(this.uid),
+            cloudSettingsRef(this.businessId),
             snapshot => {
-              if (realtimeSyncManager !== manager || !this.active || realtimeSyncUid !== this.uid) return;
+              if (realtimeSyncManager !== manager || !this.active || realtimeSyncUid !== this.businessId) return;
               applyRealtimeSettingsSnapshot(snapshot);
             },
             error => console.warn('Realtime settings listener failed:', error?.code || error?.message || error)
@@ -2528,15 +2527,15 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     realtimeSyncUid = null;
   }
 
-  function startRealtimeSynchronization(uid) {
-    const normalizedUid = String(uid || '').trim();
-    if (!normalizedUid) return;
+  function startRealtimeSynchronization(businessId) {
+    const normalizedBusinessId = String(businessId || '').trim();
+    if (!normalizedBusinessId) return;
 
     stopRealtimeSynchronization();
 
-    const manager = createRealtimeSynchronizationManager(normalizedUid);
+    const manager = createRealtimeSynchronizationManager(normalizedBusinessId);
     realtimeSyncManager = manager;
-    realtimeSyncUid = normalizedUid;
+    realtimeSyncUid = normalizedBusinessId;
     manager.start();
 
     // Hard invariant: this page owns at most one active synchronization
@@ -2677,6 +2676,18 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
   function isOwner() {
     return String(getCurrentStaff()?.role || '').toUpperCase() === 'OWNER';
+  }
+
+  function requireOwner(action = 'perform this action') {
+    if (!authReady || !sessionProfile) {
+      toast('Authentication is required.');
+      return false;
+    }
+    if (String(sessionProfile.role || '').toUpperCase() !== 'OWNER') {
+      toast(`Owner access is required to ${action}.`);
+      return false;
+    }
+    return true;
   }
 
   function formatMoney(value) {
@@ -3327,12 +3338,20 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       if (!active) {
         throw Object.assign(new Error(`Your 1911POS staff profile is inactive. Requested document: ${AUTH_PROFILE_COLLECTION}/${user.uid}`), { code: 'auth/profile-inactive', uid: user.uid });
       }
+      const businessId = String(profile.businessId || '').trim();
+      if (!businessId) {
+        throw Object.assign(
+          new Error(`Your 1911POS staff profile is missing businessId. The shared business namespace cannot be selected from the authenticated UID.`),
+          { code: 'auth/profile-business-id-missing', uid: user.uid }
+        );
+      }
       return {
         uid: user.uid,
         email: profile.email || user.email || '',
         name: profile.name || user.displayName || 'Staff Member',
         role: String(profile.role || 'STAFF').toUpperCase(),
-        active
+        active,
+        businessId
       };
     } catch (error) {
       if (String(error?.code || '').startsWith('auth/profile-')) throw error;
@@ -3356,11 +3375,12 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
     sessionProfile = profile;
     processedAuthUid = uid;
+    const businessId = String(profile.businessId || '').trim();
+    if (!businessId) throw new Error('Authenticated profile did not provide a businessId.');
 
-    // Authentication establishes identity first. Business data is then read
-    // from the UID namespace; migration metadata is never used as proof of data.
+    // Authentication establishes identity first. Business data is then read from the trusted profile businessId; migration metadata is never used as proof of data.
     try {
-      await hydrateOrMigrateCloudState(uid);
+      await hydrateOrMigrateCloudState(businessId);
     } catch (error) {
       cloudHydrationInProgress = false;
       cloudPersistenceEnabled = false;
@@ -3383,7 +3403,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       null;
 
     saveState();
-    startRealtimeSynchronization(uid);
+    startRealtimeSynchronization(businessId);
     setAuthStateView('ready', `Signed in as ${profile.name}.`, '', false);
 
     if (!uiBound) bindEvents();
@@ -4547,6 +4567,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function saveProduct() {
+    if (!requireOwner('modify products')) return;
     const name = $('p_name').value.trim();
     if (!name) return toast('Product name is required.');
     const price = Number($('p_price').value || 0);
@@ -4608,6 +4629,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function deleteProduct(id) {
+    if (!requireOwner('delete products')) return;
     const product = getProductById(id);
     if (!product) return;
     if (!confirm(`Delete product "${product.name}"?`)) return;
@@ -4621,6 +4643,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function moveProduct(id, dir) {
+    if (!requireOwner('reorder products')) return;
     const idx = state.products.findIndex(p => p.id === id);
     if (idx < 0) return;
     const next = idx + dir;
@@ -4720,6 +4743,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function saveCategory() {
+    if (!requireOwner('modify categories')) return;
     const name = $('c_name').value.trim();
     if (!name) return toast('Category name is required.');
     const order = Number($('c_order').value || state.categories.length + 1);
@@ -4740,6 +4764,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function moveCategory(id, dir) {
+    if (!requireOwner('reorder categories')) return;
     const idx = state.categories.findIndex(c => c.id === id);
     const next = idx + dir;
     if (idx < 0 || next < 0 || next >= state.categories.length) return;
@@ -4752,6 +4777,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function deleteCategory(id) {
+    if (!requireOwner('delete categories')) return;
     const cat = state.categories.find(c => c.id === id);
     if (!cat) return;
     if (state.products.some(p => p.categoryId === id)) {
@@ -4820,6 +4846,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
 
   function addTable() {
+    if (!requireOwner('create tables')) return;
     state.adminSelection = null;
     renderAdmin();
   }
@@ -4830,6 +4857,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function saveTable() {
+    if (!requireOwner('modify tables')) return;
     const label = $('t_label').value.trim();
     if (!label) return toast('Table name is required.');
     if (state.adminSelection) {
@@ -4860,6 +4888,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
 
   function deleteTable(id) {
+    if (!requireOwner('delete tables')) return;
     const t = getTableById(id);
     if (!t) return;
 
@@ -4992,6 +5021,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   function newInventory() { state.adminSelection = null; renderAdmin(); }
   function editInventory(id) { state.adminSelection = id; renderAdmin(); }
   function saveInventory() {
+    if (!requireOwner('modify inventory')) return;
     const name = $('inv_name').value.trim();
     if (!name) return toast('Inventory name is required.');
     const payload = {
@@ -5017,6 +5047,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     toast('Inventory saved.');
   }
   function deleteInventory(id) {
+    if (!requireOwner('delete inventory')) return;
     const inv = getInventoryById(id);
     if (!inv) return;
     if (state.products.some(p => (p.recipe || []).some(r => r.inventoryId === id))) {
@@ -5259,6 +5290,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   function newStaff() { state.adminSelection = null; renderAdmin(); }
   function editStaff(id) { state.adminSelection = id; renderAdmin(); }
   function saveStaff() {
+    if (!requireOwner('modify staff')) return;
     const name = $('s_name').value.trim();
     const pin = $('s_pin').value.trim();
     const role = $('s_role').value;
@@ -5280,6 +5312,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function deleteStaff(id) {
+    if (!requireOwner('delete staff')) return;
     const st = state.staff.find(s => s.id === id);
     if (!st) return;
     if (state.staff.length === 1) return toast('At least one staff member is required.');
@@ -5452,6 +5485,7 @@ function quickSwitchStaff(id) {
 
 
   function saveSettings() {
+    if (!requireOwner('modify settings')) return;
     state.settings.brandName = $('set_brand').value.trim() || '1911';
     state.settings.tableCount = state.tables.length;
     state.settings.currency = $('set_currency').value.trim() || 'IQD';
