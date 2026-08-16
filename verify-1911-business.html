@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#090806">
+<title>1911 Shared Business Diagnostic</title>
+<style>
+body{margin:0;padding:16px;background:#090806;color:#f5ead7;font-family:system-ui,sans-serif}
+main{max-width:1000px;margin:auto}.card{background:#15110c;border:1px solid rgba(215,173,85,.3);border-radius:16px;padding:16px;margin:12px 0}
+h1{font-size:24px;margin:0 0 8px}h2{font-size:18px}.sub,.small{color:#b8a98f}
+input{display:block;width:100%;box-sizing:border-box;padding:12px;margin:6px 0 12px;background:#0e0b08;color:#fff;border:1px solid #6e5730;border-radius:9px;font-size:16px}
+button{padding:12px 16px;border:0;border-radius:9px;background:#d7ad55;color:#171006;font-weight:800;margin-right:8px}
+button.secondary{background:#2a2115;color:#fff;border:1px solid #6e5730}.hidden{display:none}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}
+.kv{background:#1c160e;border-radius:10px;padding:10px}.k{color:#b8a98f;font-size:12px}.v{margin-top:4px;word-break:break-word}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#0b0907;padding:10px;border-radius:9px;font-size:12px}
+.pass{color:#62d18a}.fail{color:#ff6b6b}.warn{color:#f2c86b}
+.overall{font-size:18px;font-weight:800;border-width:2px}.overall.pass{border-color:#62d18a}.overall.fail{border-color:#ff6b6b}.overall.wait{border-color:#f2c86b}
+.doc{border-top:1px solid rgba(215,173,85,.15);padding:12px 0}.doc:first-child{border-top:0}
+.mono{font-family:ui-monospace,monospace}
+</style>
+</head>
+<body>
+<main>
+<section class="card">
+<h1>1911 Shared Business Namespace Diagnostic</h1>
+<div class="sub">READ-ONLY diagnostic based on the current Phase 4 / Phase 4 Step 3 architecture. This tool performs authentication and Firestore reads only. It does not write, migrate, normalize, use localStorage, create defaults, or create listeners.</div>
+</section>
+
+<section id="overall" class="card overall wait">WAITING — sign in to begin.</section>
+
+<section class="card">
+<h2>Firebase Login</h2>
+<form id="loginForm">
+<label>Email</label><input id="email" type="email" autocomplete="username" required>
+<label>Password</label><input id="password" type="password" autocomplete="current-password" required>
+<button id="loginButton">Sign In</button>
+<button id="signOutButton" type="button" class="secondary hidden">Sign Out</button>
+</form>
+<div id="authError"></div>
+</section>
+
+<section id="profileCard" class="card hidden">
+<h2>Authenticated Profile</h2>
+<div class="grid">
+<div class="kv"><div class="k">Authenticated UID</div><div id="uid" class="v mono">—</div></div>
+<div class="kv"><div class="k">Authenticated Email</div><div id="authEmail" class="v">—</div></div>
+<div class="kv"><div class="k">Role</div><div id="role" class="v">—</div></div>
+<div class="kv"><div class="k">Active</div><div id="active" class="v">—</div></div>
+<div class="kv"><div class="k">Business ID</div><div id="businessId" class="v mono">—</div></div>
+<div class="kv"><div class="k">Business ID Check</div><div id="businessCheck" class="v">—</div></div>
+</div>
+<h3>Complete profile data</h3><pre id="profileData">—</pre>
+</section>
+
+<section id="settingsCard" class="card hidden"><h2>Shared Business Settings</h2><div id="settingsResults"></div></section>
+<section id="collectionsCard" class="card hidden"><h2>Shared Business Collections</h2><div id="collectionResults"></div></section>
+<section id="summaryCard" class="card hidden"><h2>Final Verification</h2><pre id="summary">—</pre></section>
+</main>
+
+<script type="module">
+import {initializeApp} from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js';
+import {getAuth,setPersistence,browserLocalPersistence,onAuthStateChanged,signInWithEmailAndPassword,signOut} from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js';
+import {getFirestore,doc,getDoc,getDocs,collection} from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js';
+
+const firebaseConfig={
+ apiKey:"AIzaSyB_m-lt22FJ7fShyRHDgPEbkYTSOzMpMYM",
+ authDomain:"menu-e4cef.firebaseapp.com",
+ projectId:"menu-e4cef",
+ storageBucket:"menu-e4cef.firebasestorage.app",
+ messagingSenderId:"686608343620",
+ appId:"1:686608343620:web:cbcf3c2c4e149caaee9211",
+ measurementId:"G-RDY676HQLB"
+};
+const ROOT="1911POS", BUSINESS_ID="1911-cafe";
+const COLLECTIONS=["categories","products","inventory","orders","tables","staff"];
+const app=initializeApp(firebaseConfig),auth=getAuth(app),db=getFirestore(app);
+const $=id=>document.getElementById(id);
+const results={auth:false,profile:false,businessId:false,config:false,main:false,collections:{},errors:[]};
+
+function esc(v){return String(v).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#039;")}
+function err(e){return (e?.code||"unknown")+" — "+(e?.message||String(e))}
+function json(v){try{return JSON.stringify(v,null,2)}catch{return String(v)}}
+function overall(text,cls){$("overall").className="card overall "+cls;$("overall").textContent=text}
+function reset(){
+ results.auth=results.profile=results.businessId=results.config=results.main=false;results.collections={};results.errors=[];
+ $("profileCard").classList.add("hidden");$("settingsCard").classList.add("hidden");$("collectionsCard").classList.add("hidden");$("summaryCard").classList.add("hidden");
+ $("settingsResults").innerHTML="";$("collectionResults").innerHTML="";$("authError").textContent="";
+}
+function renderDoc(parent,path,snap){
+ const d=document.createElement("div");d.className="doc";
+ if(!snap.exists()) d.innerHTML="<strong>"+esc(path)+"</strong><div class='fail'><b>MISSING</b></div><div class='small'>Document ID: "+esc(path.split("/").pop())+"</div>";
+ else d.innerHTML="<strong>"+esc(path)+"</strong><div class='pass'><b>EXISTS</b></div><div class='small'>Document ID: "+esc(snap.id)+"</div><pre>"+esc(json(snap.data()||{}))+"</pre>";
+ parent.appendChild(d);
+}
+function renderCollection(parent,name,r){
+ const d=document.createElement("div");d.className="doc";const path=ROOT+"/"+BUSINESS_ID+"/"+name;
+ if(!r.ok){d.innerHTML="<strong>"+esc(path)+"</strong><div class='fail'><b>READ FAILED</b></div><pre>"+esc(r.error)+"</pre>";}
+ else{
+  const docs=r.docs;
+  d.innerHTML="<strong>"+esc(path)+"</strong><div class='pass'><b>READ SUCCESS</b></div><div>Document count: <b>"+docs.length+"</b></div><div class='small'>Document IDs: "+(docs.length?docs.map(x=>esc(x.id)).join(", "):"(none)")+"</div>";
+  docs.forEach(x=>{const p=document.createElement("pre");p.innerHTML="<b>"+esc(x.id)+"</b>\n"+esc(json(x.data));d.appendChild(p)});
+ }
+ parent.appendChild(d);
+}
+async function verify(user){
+ reset();overall("RUNNING — verifying shared business namespace...","wait");
+ results.auth=true;$("profileCard").classList.remove("hidden");$("uid").textContent=user.uid;$("authEmail").textContent=user.email||"(none)";
+ if(app.options.projectId!=="menu-e4cef"){results.errors.push("Firebase project mismatch: "+app.options.projectId);finish();return}
+ let snap;
+ try{snap=await getDoc(doc(db,ROOT,user.uid));if(!snap.exists())throw new Error("Profile document missing: "+ROOT+"/"+user.uid);results.profile=true}
+ catch(e){results.errors.push("Profile read: "+err(e));$("authError").innerHTML="<div class='fail'>Profile read failed: "+esc(err(e))+"</div>";finish();return}
+ const p=snap.data()||{},role=String(p.role??""),active=p.active,bid=String(p.businessId??"");
+ $("role").textContent=role||"(missing)";$("active").textContent=String(active);$("businessId").textContent=bid||"(missing)";$("profileData").textContent=json(p);
+ results.businessId=bid===BUSINESS_ID;$("businessCheck").innerHTML=results.businessId?"<span class='pass'>PASS — businessId is 1911-cafe</span>":"<span class='fail'>FAIL — expected 1911-cafe, received "+esc(bid||"(missing)")+"</span>";
+ if(!results.businessId){results.errors.push("Incorrect businessId: "+(bid||"(missing)"));finish();return}
+
+ const sr=$("settingsResults");
+ for(const id of ["config","main"]){
+  try{const s=await getDoc(doc(db,ROOT,BUSINESS_ID,"settings",id));results[id]=s.exists();renderDoc(sr,ROOT+"/"+BUSINESS_ID+"/settings/"+id,s)}
+  catch(e){results.errors.push("settings/"+id+": "+err(e));const d=document.createElement("div");d.className="doc";d.innerHTML="<strong>"+ROOT+"/"+BUSINESS_ID+"/settings/"+id+"</strong><div class='fail'><b>READ FAILED</b></div><pre>"+esc(err(e))+"</pre>";sr.appendChild(d)}
+ }
+ $("settingsCard").classList.remove("hidden");
+ const cr=$("collectionResults");
+ for(const name of COLLECTIONS){
+  try{const s=await getDocs(collection(db,ROOT,BUSINESS_ID,name));results.collections[name]={ok:true,docs:s.docs.map(x=>({id:x.id,data:x.data()||{}}))}}
+  catch(e){results.collections[name]={ok:false,error:err(e)};results.errors.push(name+": "+err(e))}
+  renderCollection(cr,name,results.collections[name]);
+ }
+ $("collectionsCard").classList.remove("hidden");finish();
+}
+function finish(){
+ const readable=COLLECTIONS.every(n=>results.collections[n]?.ok);
+ const pass=results.auth&&results.profile&&results.businessId&&results.config&&results.main&&readable&&!results.errors.length;
+ overall(pass?"PASS — shared business namespace is readable":"FAIL — shared business namespace cannot be read",pass?"pass":"fail");
+ const lines=[
+ "Firebase project: "+app.options.projectId,
+ "Authenticated UID: "+(auth.currentUser?.uid||"(none)"),
+ "Authenticated email: "+(auth.currentUser?.email||"(none)"),
+ "Profile read: "+(results.profile?"SUCCESS":"FAILED"),
+ "Business ID: "+(results.businessId?"PASS":"FAIL"),
+ "settings/config: "+(results.config?"EXISTS":"MISSING/FAILED"),
+ "settings/main: "+(results.main?"EXISTS":"MISSING/FAILED")
+ ];
+ COLLECTIONS.forEach(n=>{const r=results.collections[n];lines.push(n+": "+(!r?"NOT TESTED":r.ok?"READ SUCCESS — "+r.docs.length+" document(s)":"READ FAILED — "+r.error))});
+ if(results.errors.length){lines.push("","Errors / failures:");results.errors.forEach(x=>lines.push("- "+x))}
+ else lines.push("","No diagnostic errors reported.");
+ $("summary").textContent=lines.join("\n");$("summaryCard").classList.remove("hidden");
+}
+$("loginForm").addEventListener("submit",async e=>{
+ e.preventDefault();$("loginButton").disabled=true;$("authError").textContent="";
+ try{await signInWithEmailAndPassword(auth,$("email").value.trim(),$("password").value)}
+ catch(x){$("authError").innerHTML="<div class='fail'>Authentication failed: "+esc(err(x))+"</div>";overall("FAIL — authentication failed","fail")}
+ finally{$("loginButton").disabled=false}
+});
+$("signOutButton").addEventListener("click",()=>signOut(auth).catch(e=>$("authError").innerHTML="<div class='fail'>Sign-out failed: "+esc(err(e))+"</div>"));
+onAuthStateChanged(auth,async user=>{
+ if(!user){$("signOutButton").classList.add("hidden");$("loginButton").classList.remove("hidden");overall("WAITING — sign in to begin.","wait");return}
+ $("signOutButton").classList.remove("hidden");$("loginButton").classList.add("hidden");await verify(user);
+});
+setPersistence(auth,browserLocalPersistence).catch(e=>$("authError").innerHTML="<div class='warn'>Persistence warning: "+esc(err(e))+"</div>");
+</script>
+</body>
+</html>
