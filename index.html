@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#070707" />
-  <title>1911 Café POS — Phase 5 Hydration Diagnostic</title>
+  <title>1911 Café POS</title>
   <style>
     :root{
       --bg:#050505;
@@ -1505,26 +1505,9 @@
     }
 
   </style>
-
-<style id="phase5-diagnostic-css">
-#phase5DiagnosticPanel{position:fixed;left:10px;right:10px;top:10px;z-index:2147483647;max-height:48vh;overflow:auto;padding:12px;border:2px solid #d8af54;border-radius:16px;background:rgba(5,5,5,.97);color:#f3efe6;font:12px/1.4 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;box-shadow:0 12px 40px rgba(0,0,0,.65)}
-#phase5DiagnosticPanel h3{margin:0 0 8px;font-size:15px}
-#phase5DiagnosticPanel .diagRow{display:flex;gap:8px;margin:3px 0;word-break:break-word}
-#phase5DiagnosticPanel .diagKey{min-width:220px;font-weight:800}
-#phase5DiagnosticPanel .diagVal{font-weight:600}
-#phase5DiagnosticPanel .ok{color:#55c175}.bad{color:#df5b5b}.warn{color:#f1a93b}
-@media(max-width:600px){#phase5DiagnosticPanel{font-size:11px;max-height:54vh}.diagKey{min-width:145px}}
-</style>
-
 </head>
 
 <body data-auth-state="loading">
-
-<div id="phase5DiagnosticPanel" aria-live="polite">
-<h3>PHASE 5 — TABLE HYDRATION DIAGNOSTIC (TEMPORARY)</h3>
-<div id="phase5DiagnosticRows"></div>
-</div>
-
 <div class="authView" id="authView">
   <div class="authShell">
     <div class="authHero">
@@ -1745,43 +1728,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   let cloudSyncTimer = null;
   let cloudSyncInFlight = false;
   let cloudSyncPending = false;
-
-  // TEMPORARY DIAGNOSTIC ONLY — does not change Firestore writes, listeners, auth, or state logic.
-  const phase5Diag = {
-    uid:'—', profileLoaded:'NOT STARTED', profileRole:'—', profileActive:'—',
-    hydrationStarted:'NOT STARTED', readStarted:'NOT STARTED',
-    tablesGetDocsStarted:'NOT STARTED', tablesGetDocsSucceeded:'NOT STARTED',
-    tableCount:'—', realtimeTestReturned:'—', applyReceivedRealtimeTest:'—',
-    finalStateRealtimeTest:'—', error:'—',
-    classification:'E — hydration never reached the tables read'
-  };
-  function phase5DiagEsc(v){return String(v ?? '—').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
-  function updatePhase5Diagnostic(){
-    const el=document.getElementById('phase5DiagnosticRows'); if(!el)return;
-    const rows=[
-      ['Authenticated UID',phase5Diag.uid],
-      ['loadStaffProfile() succeeded',phase5Diag.profileLoaded],
-      ['Profile role',phase5Diag.profileRole],
-      ['Profile active',phase5Diag.profileActive],
-      ['hydrateOrMigrateCloudState() started',phase5Diag.hydrationStarted],
-      ['readCloudBusinessState(uid) started',phase5Diag.readStarted],
-      ['tables getDocs() started',phase5Diag.tablesGetDocsStarted],
-      ['tables getDocs() succeeded',phase5Diag.tablesGetDocsSucceeded],
-      ['Table documents returned',phase5Diag.tableCount],
-      ['REALTIME_TEST returned',phase5Diag.realtimeTestReturned],
-      ['applyCloudBusinessState() receives REALTIME_TEST',phase5Diag.applyReceivedRealtimeTest],
-      ['final state.tables contains REALTIME_TEST',phase5Diag.finalStateRealtimeTest],
-      ['Exact Firestore error',phase5Diag.error],
-      ['FINAL CLASSIFICATION',phase5Diag.classification]
-    ];
-    el.innerHTML=rows.map(([k,v])=>{
-      const s=String(v);
-      const cls=/FAILED|DENIED|ERROR|NOT STARTED|false|—/.test(s)?'bad':/SUCCEEDED|true/.test(s)?'ok':'warn';
-      return `<div class="diagRow"><span class="diagKey">${phase5DiagEsc(k)}</span><span class="diagVal ${cls}">${phase5DiagEsc(v)}</span></div>`;
-    }).join('');
-  }
-  function phase5DiagError(error){phase5Diag.error=error?`${error.code||'unknown'} — ${error.message||String(error)}`:'—';}
-  updatePhase5Diagnostic();
   let cloudKnownRecordIds = new Map();
   let cloudSyncedBusinessState = null;
   let realtimeSyncManager = null;
@@ -1997,26 +1943,8 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   async function readCloudBusinessState(uid) {
-    phase5Diag.readStarted='YES';
-    phase5Diag.tablesGetDocsStarted='YES';
-    updatePhase5Diagnostic();
-
-    const tableRead = getDocs(cloudCollectionRef(uid,'tables')).then(snap=>{
-      phase5Diag.tablesGetDocsSucceeded='YES';
-      phase5Diag.tableCount=String(snap.size);
-      phase5Diag.realtimeTestReturned=String(snap.docs.some(d=>d.id==='REALTIME_TEST'));
-      updatePhase5Diagnostic();
-      return snap;
-    }).catch(error=>{
-      phase5Diag.tablesGetDocsSucceeded='NO';
-      phase5DiagError(error);
-      phase5Diag.classification='A — getDocs failed';
-      updatePhase5Diagnostic();
-      throw error;
-    });
-
     const results = await Promise.all([
-      ...CLOUD_COLLECTIONS.map(name => name==='tables' ? tableRead : getDocs(cloudCollectionRef(uid,name))),
+      ...CLOUD_COLLECTIONS.map(name => getDocs(cloudCollectionRef(uid, name))),
       getDoc(cloudSettingsRef(uid))
     ]);
     const cloud = { categories: [], products: [], inventory: [], orders: [], tables: [], staff: [], settings: null };
@@ -2045,8 +1973,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function applyCloudBusinessState(cloud) {
-    phase5Diag.applyReceivedRealtimeTest=String(Array.isArray(cloud?.tables)&&cloud.tables.some(t=>t?.id==='REALTIME_TEST'));
-    updatePhase5Diagnostic();
     const d = defaultState();
 
     // Once Firestore contains business records, it is the authoritative
@@ -2272,24 +2198,12 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   async function hydrateOrMigrateCloudState(uid) {
-    phase5Diag.hydrationStarted='YES';
-    phase5Diag.uid=String(uid||'—');
-    updatePhase5Diagnostic();
     cloudHydrationInProgress = true;
     cloudPersistenceEnabled = false;
     try {
       const cloud = await readCloudBusinessState(uid);
       if (cloud.hasBusinessRecords) {
         applyCloudBusinessState(cloud);
-        phase5Diag.finalStateRealtimeTest=String(Array.isArray(state.tables)&&state.tables.some(t=>t?.id==='REALTIME_TEST'));
-        if(phase5Diag.realtimeTestReturned==='true'){
-          phase5Diag.classification=phase5Diag.finalStateRealtimeTest==='true'
-            ? 'D — REALTIME_TEST reached state.tables; inspect rendering'
-            : 'C — getDocs returned REALTIME_TEST but application removed it afterward';
-        } else if(phase5Diag.tablesGetDocsSucceeded==='YES'){
-          phase5Diag.classification='B — getDocs succeeded but REALTIME_TEST was not returned';
-        }
-        updatePhase5Diagnostic();
         setCloudSyncedBusinessState(businessStateForCloud());
         saveState();
         cloudPersistenceEnabled = true;
@@ -2307,10 +2221,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       await writeCloudBusinessState(uid, 'defaultState', true);
       cloudPersistenceEnabled = true;
       return { mode: 'initialized', hasBusinessRecords: false };
-    } catch (error) {
-      phase5DiagError(error);
-      updatePhase5Diagnostic();
-      throw error;
     } finally {
       cloudHydrationInProgress = false;
     }
@@ -2767,18 +2677,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
   function isOwner() {
     return String(getCurrentStaff()?.role || '').toUpperCase() === 'OWNER';
-  }
-
-  function requireOwner(action = 'perform this action') {
-    if (!authReady || !sessionProfile) {
-      toast('Authentication is required.');
-      return false;
-    }
-    if (String(sessionProfile.role || '').toUpperCase() !== 'OWNER') {
-      toast(`Owner access is required to ${action}.`);
-      return false;
-    }
-    return true;
   }
 
   function formatMoney(value) {
@@ -3419,7 +3317,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
   async function loadStaffProfile(user) {
     try {
-      phase5Diag.uid=String(user?.uid||'—'); updatePhase5Diagnostic();
       const staffRef = doc(db, AUTH_PROFILE_COLLECTION, user.uid);
       const staffSnap = await getDoc(staffRef);
       if (!staffSnap.exists()) {
@@ -3430,10 +3327,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       if (!active) {
         throw Object.assign(new Error(`Your 1911POS staff profile is inactive. Requested document: ${AUTH_PROFILE_COLLECTION}/${user.uid}`), { code: 'auth/profile-inactive', uid: user.uid });
       }
-      phase5Diag.profileLoaded='YES';
-      phase5Diag.profileRole=String(profile.role||'STAFF').toUpperCase();
-      phase5Diag.profileActive=String(active);
-      updatePhase5Diagnostic();
       return {
         uid: user.uid,
         email: profile.email || user.email || '',
@@ -3477,7 +3370,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     if (transitionToken !== authTransitionToken) return;
 
     authReady = true;
-    if(phase5Diag.tablesGetDocsStarted!=='YES'){phase5Diag.classification='E — hydration never reached the tables read'; updatePhase5Diagnostic();}
 
     // Preserve the existing staff authorization behavior and map the
     // authenticated profile onto the existing local staff record.
@@ -4655,7 +4547,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function saveProduct() {
-    if (!requireOwner('modify products')) return;
     const name = $('p_name').value.trim();
     if (!name) return toast('Product name is required.');
     const price = Number($('p_price').value || 0);
@@ -4717,7 +4608,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function deleteProduct(id) {
-    if (!requireOwner('delete products')) return;
     const product = getProductById(id);
     if (!product) return;
     if (!confirm(`Delete product "${product.name}"?`)) return;
@@ -4731,7 +4621,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function moveProduct(id, dir) {
-    if (!requireOwner('reorder products')) return;
     const idx = state.products.findIndex(p => p.id === id);
     if (idx < 0) return;
     const next = idx + dir;
@@ -4831,7 +4720,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function saveCategory() {
-    if (!requireOwner('modify categories')) return;
     const name = $('c_name').value.trim();
     if (!name) return toast('Category name is required.');
     const order = Number($('c_order').value || state.categories.length + 1);
@@ -4852,7 +4740,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function moveCategory(id, dir) {
-    if (!requireOwner('reorder categories')) return;
     const idx = state.categories.findIndex(c => c.id === id);
     const next = idx + dir;
     if (idx < 0 || next < 0 || next >= state.categories.length) return;
@@ -4865,7 +4752,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function deleteCategory(id) {
-    if (!requireOwner('delete categories')) return;
     const cat = state.categories.find(c => c.id === id);
     if (!cat) return;
     if (state.products.some(p => p.categoryId === id)) {
@@ -4934,7 +4820,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
 
   function addTable() {
-    if (!requireOwner('create tables')) return;
     state.adminSelection = null;
     renderAdmin();
   }
@@ -4945,7 +4830,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function saveTable() {
-    if (!requireOwner('modify tables')) return;
     const label = $('t_label').value.trim();
     if (!label) return toast('Table name is required.');
     if (state.adminSelection) {
@@ -4976,7 +4860,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
 
   function deleteTable(id) {
-    if (!requireOwner('delete tables')) return;
     const t = getTableById(id);
     if (!t) return;
 
@@ -5109,7 +4992,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   function newInventory() { state.adminSelection = null; renderAdmin(); }
   function editInventory(id) { state.adminSelection = id; renderAdmin(); }
   function saveInventory() {
-    if (!requireOwner('modify inventory')) return;
     const name = $('inv_name').value.trim();
     if (!name) return toast('Inventory name is required.');
     const payload = {
@@ -5135,7 +5017,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     toast('Inventory saved.');
   }
   function deleteInventory(id) {
-    if (!requireOwner('delete inventory')) return;
     const inv = getInventoryById(id);
     if (!inv) return;
     if (state.products.some(p => (p.recipe || []).some(r => r.inventoryId === id))) {
@@ -5378,7 +5259,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   function newStaff() { state.adminSelection = null; renderAdmin(); }
   function editStaff(id) { state.adminSelection = id; renderAdmin(); }
   function saveStaff() {
-    if (!requireOwner('modify staff')) return;
     const name = $('s_name').value.trim();
     const pin = $('s_pin').value.trim();
     const role = $('s_role').value;
@@ -5400,7 +5280,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function deleteStaff(id) {
-    if (!requireOwner('delete staff')) return;
     const st = state.staff.find(s => s.id === id);
     if (!st) return;
     if (state.staff.length === 1) return toast('At least one staff member is required.');
@@ -5573,7 +5452,6 @@ function quickSwitchStaff(id) {
 
 
   function saveSettings() {
-    if (!requireOwner('modify settings')) return;
     state.settings.brandName = $('set_brand').value.trim() || '1911';
     state.settings.tableCount = state.tables.length;
     state.settings.currency = $('set_currency').value.trim() || 'IQD';
