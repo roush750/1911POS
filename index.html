@@ -1810,6 +1810,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       { id: uid('cat'), name: 'Desserts', order: 5, active: true },
       { id: uid('cat'), name: 'Snacks', order: 6, active: true }
     ],
+    recipeOverrides: {},
     products: [
       {
         id: uid('prd'),
@@ -1957,95 +1958,9 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     if (cloudPersistenceEnabled && !cloudHydrationInProgress && sessionProfile?.businessId) {
       scheduleCloudPersistence();
     }
-    if (authReady && sessionProfile?.businessId && String(sessionProfile.role || '').toUpperCase() === 'OWNER' && !applyingSharedCatalog) {
-      publishSharedCatalogFromPOS();
-    }
   }
 
-  const CLOUD_COLLECTIONS = ['categories', 'products', 'inventory', 'orders', 'tables', 'staff'];
-
-  // Shared catalog bridge. Only product/category names, prices, sizes, category links,
-  // and customer-menu visibility cross the POS/Admin boundary.
-  const SHARED_CATALOG_DOC_PATH = ['menuSites', '1911CoffeeShop', 'shared', 'catalog'];
-  let sharedCatalogRef = null;
-  let sharedCatalogUnsub = null;
-  let applyingSharedCatalog = false;
-
-  function buildSharedCatalogFromPOSState(){
-    return {
-      schemaVersion: 1,
-      categories: (state.categories || []).map((c, index) => ({
-        id: String(c.id), name: String(c.name || `Category ${index + 1}`), order: Number(c.order || index + 1)
-      })),
-      products: (state.products || []).map(p => {
-        const base = Number(p.price || 0);
-        const sizes = Array.isArray(p.variants) && p.variants.length
-          ? p.variants.map(v => ({ name: String(v.name || 'Regular'), price: base + Number(v.priceDelta || 0) }))
-          : [{ name: 'Regular', price: base }];
-        return {
-          id: String(p.id), name: String(p.name || 'Product'), categoryId: String(p.categoryId || ''),
-          price: base, sizes, menuVisible: p.menuVisible !== false
-        };
-      }),
-      updatedAt: Date.now(),
-      updatedBy: sessionProfile?.uid || 'pos'
-    };
-  }
-
-  function applySharedCatalogToPOSState(shared){
-    if (!shared || !Array.isArray(shared.categories) || !Array.isArray(shared.products)) return false;
-    const oldCategories = new Map((state.categories || []).map(c => [String(c.id), c]));
-    state.categories = shared.categories.map((c, index) => ({
-      ...(oldCategories.get(String(c.id)) || {}),
-      id: String(c.id), name: String(c.name || 'Category'), order: Number(c.order || index + 1), active: oldCategories.get(String(c.id))?.active !== false
-    }));
-    const oldProducts = new Map((state.products || []).map(p => [String(p.id), p]));
-    state.products = shared.products.map(p => {
-      const old = oldProducts.get(String(p.id)) || {};
-      const sizes = Array.isArray(p.sizes) ? p.sizes : [];
-      const base = Number(p.price ?? sizes[0]?.price ?? old.price ?? 0);
-      const variants = sizes.map(s => ({ name: String(s.name || 'Regular'), priceDelta: Number(s.price || base) - base }));
-      return {
-        ...old, id: String(p.id), name: String(p.name || old.name || 'Product'), categoryId: String(p.categoryId || ''),
-        price: base, variants: variants.length > 1 || (variants.length === 1 && variants[0].name !== 'Regular') ? variants : [],
-        menuVisible: p.menuVisible !== false, image: old.image || '', description: old.description || '', available: old.available !== false, recipe: Array.isArray(old.recipe) ? old.recipe : []
-      };
-    });
-    if (!state.categories.some(c => c.id === state.activeCategoryId)) state.activeCategoryId = 'all';
-    return true;
-  }
-
-  async function publishSharedCatalogFromPOS(){
-    if (applyingSharedCatalog || !authReady || !sessionProfile || String(sessionProfile.role || '').toUpperCase() !== 'OWNER') return;
-    try {
-      sharedCatalogRef = sharedCatalogRef || doc(db, ...SHARED_CATALOG_DOC_PATH);
-      await setDoc(sharedCatalogRef, buildSharedCatalogFromPOSState(), { merge: true });
-    } catch (err) { console.warn('Shared catalog POS publish failed:', err); }
-  }
-
-  async function startSharedCatalogSynchronization(){
-    if (!db || !sessionProfile) return;
-    try {
-      sharedCatalogRef = doc(db, ...SHARED_CATALOG_DOC_PATH);
-      const snap = await getDoc(sharedCatalogRef);
-      if (snap.exists()) {
-        applyingSharedCatalog = true;
-        try { applySharedCatalogToPOSState(snap.data()); saveState(); }
-        finally { applyingSharedCatalog = false; }
-      }
-      if (sharedCatalogUnsub) sharedCatalogUnsub();
-      sharedCatalogUnsub = onSnapshot(sharedCatalogRef, remoteSnap => {
-        if (!remoteSnap.exists() || applyingSharedCatalog) return;
-        applyingSharedCatalog = true;
-        try {
-          applySharedCatalogToPOSState(remoteSnap.data());
-          saveState();
-          renderAll();
-        } finally { applyingSharedCatalog = false; }
-      }, err => console.warn('Shared catalog listener error:', err));
-    } catch (err) { console.warn('Shared catalog synchronization startup failed:', err); }
-  }
-
+  const CLOUD_COLLECTIONS = ['inventory', 'orders', 'tables', 'staff', 'recipes'];
 
   function cloudNamespace(businessId) {
     const normalizedBusinessId = String(businessId || '').trim();
@@ -2079,8 +1994,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       if (order?.id) orderMap.set(order.id, safeClone(order));
     });
     return {
-      categories: safeClone(state.categories || []),
-      products: safeClone(state.products || []),
+      recipes: Object.entries(state.recipeOverrides || {}).map(([id, recipe]) => ({ id: String(id), recipe: safeClone(recipe || []) })),
       inventory: safeClone(state.inventory || []),
       orders: [...orderMap.values()],
       tables: safeClone(state.tables || []),
@@ -2095,7 +2009,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       ...CLOUD_COLLECTIONS.map(name => getDocs(cloudCollectionRef(businessId, name))),
       getDoc(cloudSettingsRef(businessId))
     ]);
-    const cloud = { categories: [], products: [], inventory: [], orders: [], tables: [], staff: [], settings: null };
+    const cloud = { inventory: [], orders: [], tables: [], staff: [], recipes: [], settings: null };
     CLOUD_COLLECTIONS.forEach((name, index) => {
       cloud[name] = results[index].docs.map(snap => ({ id: snap.id, ...snap.data() }));
     });
@@ -2130,9 +2044,9 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     state.settings = cloud.settings
       ? { ...d.settings, ...(cloud.settings.settings || cloud.settings) }
       : state.settings;
-    state.categories = (cloud.categories || []).map(record => ({ ...safeClone(record), id: String(record.id) }));
-    state.products = (cloud.products || []).map(record => ({ ...safeClone(record), id: String(record.id) }));
+    state.recipeOverrides = Object.fromEntries((cloud.recipes || []).map(record => [String(record.id), safeClone(record.recipe || [])]));
     state.inventory = (cloud.inventory || []).map(record => ({ ...safeClone(record), id: String(record.id) }));
+    state.products = (state.products || []).map(product => ({ ...product, recipe: safeClone(state.recipeOverrides[product.id] || product.recipe || []) }));
     state.tables = stableSortTables((cloud.tables || []).map(record => ({ ...safeClone(record), id: String(record.id) })));
     state.staff = (cloud.staff || []).map(record => ({ ...safeClone(record), id: String(record.id) }));
 
@@ -2150,8 +2064,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
   function cloneCloudBusinessState(business) {
     return safeClone(business || {
-      categories: [],
-      products: [],
+      recipes: [],
       inventory: [],
       orders: [],
       tables: [],
@@ -2173,12 +2086,11 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     const writes = [];
     const deletes = [];
     const dirty = {
-      categories: new Set(),
-      products: new Set(),
       inventory: new Set(),
       orders: new Set(),
       tables: new Set(),
       staff: new Set(),
+      recipes: new Set(),
       settings: false
     };
 
@@ -2233,8 +2145,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
   function dirtySummary(dirty) {
     return {
-      categories: dirty.categories.size,
-      products: dirty.products.size,
       inventory: dirty.inventory.size,
       orders: dirty.orders.size,
       tables: dirty.tables.size,
@@ -2248,8 +2158,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     const hadSyncedBaseline = Boolean(cloudSyncedBusinessState);
     const baseline = fullSync || !hadSyncedBaseline
       ? {
-          categories: [],
-          products: [],
           inventory: [],
           orders: [],
           tables: [],
@@ -2362,13 +2270,79 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       // this step. Existing UID-scoped localStorage may belong to the old
       // architecture and must never be silently uploaded into the new
       // business namespace. Migration/bootstrap is a separate approved step.
-      throw Object.assign(
-        new Error(`Shared business namespace 1911POS/${businessId} is not initialized. Existing local data was not migrated or uploaded.`),
-        { code: 'business/shared-namespace-not-initialized', businessId }
-      );
+      // Catalog data is owned by menuSites/1911CoffeeShop. POS operational
+      // collections may legitimately start empty; do not block the POS just
+      // because inventory/orders/tables have not been created yet.
+      setCloudSyncedBusinessState(businessStateForCloud());
+      saveState();
+      cloudPersistenceEnabled = true;
+      return { mode: 'initialized', hasBusinessRecords: false };
     } finally {
       cloudHydrationInProgress = false;
     }
+  }
+
+  // Catalog authority: Admin writes menuSites/1911CoffeeShop; POS only reads it.
+  const SHARED_CATALOG_DOC = doc(db, 'menuSites', '1911CoffeeShop');
+  let sharedCatalogUnsub = null;
+
+  function applySharedCatalog(raw) {
+    const categories = Array.isArray(raw?.categories) ? raw.categories : [];
+    const oldProducts = new Map((state.products || []).map(p => [String(p.id), p]));
+    const nextCategories = categories.map((cat, index) => ({
+      id: String(cat.id || uid('cat')),
+      name: String(cat.names?.en || cat.name || `Category ${index + 1}`),
+      order: Number(cat.order || index + 1),
+      active: cat.active !== false,
+      menuVisible: cat.menuVisible !== false
+    }));
+    const nextProducts = [];
+    categories.forEach(cat => {
+      (Array.isArray(cat.items) ? cat.items : []).forEach((item, index) => {
+        const id = String(item.id || uid('prd'));
+        const previous = oldProducts.get(id) || {};
+        const small = Number(item.prices?.small || 0);
+        const large = Number(item.prices?.large || 0);
+        const basePrice = small || large || 0;
+        const variants = large && large !== basePrice
+          ? [{ name: 'Large', priceDelta: large - basePrice }]
+          : [];
+        nextProducts.push({
+          ...previous,
+          id,
+          name: String(item.names?.en || item.name || 'Item'),
+          price: basePrice,
+          categoryId: String(cat.id),
+          image: String(item.image || ''),
+          description: String(item.desc?.en || item.description || ''),
+          // menuVisible belongs to Admin/menu. POS can still sell an item hidden from the public menu.
+          available: true,
+          menuVisible: item.menuVisible !== false,
+          variants,
+          recipe: safeClone(state.recipeOverrides?.[id] || previous.recipe || [])
+        });
+      });
+    });
+    state.categories = nextCategories;
+    state.products = nextProducts;
+    if (!state.categories.some(c => c.id === state.activeCategoryId)) state.activeCategoryId = 'all';
+    if (!state.adminSelection || !state.products.some(p => p.id === state.adminSelection)) state.adminSelection = state.products[0]?.id || null;
+    writeLocalStateOnly();
+    renderHeaderState();
+    renderCategories();
+    renderProducts();
+    renderOrderPanel();
+    refreshVisibleProductBrowser();
+    if ($('adminRoot') && state.adminTab === 'recipes') renderAdminContent();
+  }
+
+  function startSharedCatalogListener() {
+    if (sharedCatalogUnsub) sharedCatalogUnsub();
+    sharedCatalogUnsub = onSnapshot(SHARED_CATALOG_DOC, snap => {
+      if (!snap.exists()) return;
+      try { applySharedCatalog(snap.data() || {}); }
+      catch (error) { console.warn('Shared catalog apply failed:', error); }
+    }, error => console.warn('Shared catalog listener failed:', error?.code || error?.message || error));
   }
 
   /*
@@ -2718,6 +2692,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     state.settings.supplierPurchases = Array.isArray(state.settings.supplierPurchases) ? state.settings.supplierPurchases : [];
     state.settings.expenses = Array.isArray(state.settings.expenses) ? state.settings.expenses : [];
     state.categories = normalizeArray(state.categories, d.categories);
+    state.recipeOverrides = (state.recipeOverrides && typeof state.recipeOverrides === 'object') ? state.recipeOverrides : {};
     state.inventory = normalizeArray(state.inventory, d.inventory);
     state.products = normalizeArray(state.products, d.products);
     state.tables = stableSortTables(normalizeArray(state.tables, []));
@@ -3559,9 +3534,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
     const profile = await loadStaffProfile(user);
     if (transitionToken !== authTransitionToken) return;
-    if (String(profile.role || '').toUpperCase() !== 'OWNER') {
-      throw Object.assign(new Error('Only the owner account can use the POS.'), { code: 'auth/owner-only' });
-    }
 
     sessionProfile = profile;
     processedAuthUid = uid;
@@ -3594,7 +3566,6 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
     saveState();
     startRealtimeSynchronization(businessId);
-    await startSharedCatalogSynchronization();
     setAuthStateView('ready', `Signed in as ${profile.name}.`, '', false);
 
     if (!uiBound) bindEvents();
@@ -4536,7 +4507,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function ownerTabs() {
-    const tabs = ['products', 'categories', 'tables', 'inventory', 'supplierPayments', 'revenue'];
+    const tabs = ['recipes', 'tables', 'inventory', 'supplierPayments', 'revenue'];
     if (isOwner()) tabs.push('staff', 'settings');
     return tabs;
   }
@@ -4560,8 +4531,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
   function adminTabLabel(tab) {
     return ({
-      products: 'Products',
-      categories: 'Categories',
+      recipes: 'Recipes',
       tables: 'Tables',
       inventory: 'Inventory',
       supplierPayments: 'Supplier Payments',
@@ -4591,8 +4561,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     list.classList.remove('revenueTheme');
     editor.classList.remove('revenueTheme');
 
-    if (tab === 'products') return renderProductsAdmin(list, editor);
-    if (tab === 'categories') return renderCategoriesAdmin(list, editor);
+    if (tab === 'recipes') return renderProductsAdmin(list, editor);
     if (tab === 'tables') return renderTablesAdmin(list, editor);
     if (tab === 'inventory') return renderInventoryAdmin(list, editor);
     if (tab === 'supplierPayments') return renderSupplierPaymentsAdmin(list, editor);
@@ -4690,6 +4659,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   }
 
   function renderProductsAdmin(list, editor) {
+    const recipesOnly = state.adminTab === 'recipes';
     const search = String(state.adminProductSearch || '').trim().toLowerCase();
     const selectedCategoryId = state.adminProductCategoryId || 'all';
     const categories = [...state.categories].sort((a, b) => (a.order || 0) - (b.order || 0));
@@ -4712,10 +4682,9 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     list.innerHTML = `
       <div class="adminListHead">
         <div>
-          <h3 style="margin:0">Products</h3>
-          <div class="subtle">Browse categories first, then edit the products inside the selected category.</div>
+          <h3 style="margin:0">Recipes</h3>
+          <div class="subtle">Products, names, categories, prices, sizes and menu content are managed in Admin. POS only edits inventory ingredients.</div>
         </div>
-
       </div>
 
       <div class="toolbar" style="margin-bottom:12px">
@@ -4752,8 +4721,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
               <span class="historyBadge">${(p.variants || []).length ? `${p.variants.length} sizes` : 'Simple'}</span>
             </div>
             <div class="adminItemActions">
-              <button class="mini" onclick="window.__1911.editProduct('${p.id}')">Edit</button>
-              <button class="mini danger" onclick="window.__1911.deleteProduct('${p.id}')">Delete</button>
+              <button class="mini" onclick="window.__1911.editProduct('${p.id}')">Edit recipe</button>
             </div>
           </div>
         `).join('') || '<div class="emptyState">No products match this category or search.</div>'}
@@ -4767,29 +4735,49 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
 
   function productFormHtml(productId) {
     const product = productId ? getProductById(productId) : null;
+    const recipesOnly = state.adminTab === 'recipes';
     const selectedCategory = product?.categoryId || (state.adminProductCategoryId && state.adminProductCategoryId !== 'all' ? state.adminProductCategoryId : state.categories[0]?.id || '');
     const recipeRows = product?.recipe?.length ? product.recipe : [{ inventoryId: '', amount: 1, unit: '' }];
     return `
       <div class="adminEditorHead">
         <div>
-          <h3 style="margin:0">${product ? 'Edit product' : 'Product pricing'}</h3>
-          <div class="subtle">POS controls only pricing, sizes, and inventory ingredients. Name, category, image, and description come from Admin.</div>
+          <h3 style="margin:0">${recipesOnly ? 'Edit recipe' : (product ? 'Edit product' : 'New product')}</h3>
+          <div class="subtle">${recipesOnly ? 'Catalog fields are read-only here. Edit ingredients and recipe quantities only.' : 'Catalog fields are managed by the Admin Panel.'}</div>
         </div>
       </div>
       <div class="adminForm" id="productForm">
-        <div class="field">
-          <div class="formLabel">Product</div>
-          <div class="tag">${escapeHtml(product?.name || 'Select a product in Admin')}</div>
-          <div class="subtle" style="margin-top:6px">Category: ${escapeHtml(product ? getCategoryName(product.categoryId) : getCategoryName(selectedCategory))}</div>
+        <div class="formRow">
+          <div class="field">
+            <div class="formLabel">Name</div>
+            <input class="input" id="p_name" value="${escapeAttr(product?.name || '')}" ${recipesOnly ? 'readonly' : ''} />
+          </div>
+          <div class="field">
+            <div class="formLabel">Price</div>
+            <input class="input" id="p_price" type="number" min="0" step="1" value="${Number(product?.price || 0)}" readonly />
+          </div>
+        </div>
+        <div class="formRow">
+          <div class="field">
+            <div class="formLabel">Category</div>
+            <select class="select" id="p_category" disabled>
+              ${state.categories.map(c => `<option value="${c.id}" ${selectedCategory === c.id ? 'selected' : ''}>${escapeHtml(c.name)}</option>`).join('')}
+            </select>
+          </div>
+          <div class="field">
+            <div class="formLabel">Image URL</div>
+            <input class="input" id="p_image" value="${escapeAttr(product?.image || '')}" placeholder="Admin managed" readonly />
+          </div>
         </div>
         <div class="field">
-          <div class="formLabel">Price</div>
-          <input class="input" id="p_price" type="number" min="0" step="1" value="${Number(product?.price || 0)}" />
+          <div class="formLabel">Description</div>
+          <textarea class="textarea" id="p_desc" readonly>${escapeHtml(product?.description || '')}</textarea>
         </div>
-
+        <div class="checkboxRow">
+          <label><input type="checkbox" id="p_available" ${product?.available !== false ? 'checked' : ''} disabled /> Available</label>
+        </div>
         <div class="field">
           <div class="formLabel">Variants</div>
-          <textarea class="textarea" id="p_variants" placeholder="Regular|0&#10;Large|1000">${escapeHtml((product?.variants || []).map(v => `${v.name}|${v.priceDelta || 0}`).join('\n'))}</textarea>
+          <textarea class="textarea" id="p_variants" readonly placeholder="Regular|0&#10;Large|1000">${escapeHtml((product?.variants || []).map(v => `${v.name}|${v.priceDelta || 0}`).join('\n'))}</textarea>
         </div>
         <div class="field">
           <div class="formLabel">Ingredients &amp; cost</div>
@@ -4810,8 +4798,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
             </div>
           ` : ''}
         </div>
-        <button class="mini primary" type="button" onclick="window.__1911.saveProduct()">Save product</button>
-        
+        <button class="mini primary" type="button" onclick="window.__1911.saveProduct()">Save recipe</button>
       </div>
     `;
     return;
@@ -4870,7 +4857,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     if (!preview) return;
     const product = {
       id: state.adminSelection || '',
-      name: getProductById(state.adminSelection)?.name || 'Product',
+      name: $('p_name')?.value?.trim() || 'Draft product',
       price: Number($('p_price')?.value || 0),
       recipe: rows
     };
@@ -4893,25 +4880,15 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       holder.addEventListener('change', refreshRecipeEditorCosting);
     }
     $('p_price')?.addEventListener('input', refreshRecipeEditorCosting);
+    $('p_name')?.addEventListener('input', refreshRecipeEditorCosting);
     refreshRecipeEditorCosting();
   }
 
   function saveProduct() {
-    if (!requireOwner('modify products')) return;
-    const existingProduct = state.adminSelection ? getProductById(state.adminSelection) : null;
-    const name = existingProduct?.name || '';
-    if (!name) return toast('Select an existing product from Admin first.');
-    const price = Number($('p_price').value || 0);
-
-    const variants = String($('p_variants').value || '')
-      .split('\n')
-      .map(line => line.trim())
-      .filter(Boolean)
-      .map(line => {
-        const [n, d] = line.split('|');
-        return { name: (n || '').trim(), priceDelta: Number(d || 0) };
-      })
-      .filter(v => v.name);
+    if (!requireOwner('modify recipes')) return;
+    const productId = state.adminSelection;
+    const existing = productId ? getProductById(productId) : null;
+    if (!existing) return toast('Select an existing product from the shared catalog first.');
 
     const recipe = [...$('recipeRows').querySelectorAll('.recipeRow')].map(row => ({
       inventoryId: row.querySelector('.recipeInv').value,
@@ -4928,21 +4905,14 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
       }
     }
 
-    if (state.adminSelection) {
-      const existing = getProductById(state.adminSelection);
-      if (existing) {
-        Object.assign(existing, { price, variants, recipe });
-      }
-    } else {
-      toast('Products are created in Admin.');
-      return;
-    }
-    state.adminSelection = null;
+    state.recipeOverrides = state.recipeOverrides || {};
+    state.recipeOverrides[existing.id] = recipe;
+    existing.recipe = recipe;
     saveState();
     persistBusinessMutation();
     renderAll();
     renderAdmin();
-    toast('Product saved.');
+    toast('Recipe saved.');
   }
 
   function editProduct(id) {
@@ -4952,25 +4922,9 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     renderAdmin();
   }
 
-  function newProduct() {
-    toast('Products are created and named in Admin.');
-  }
+  function newProduct() { toast('Products are created in the Admin Panel.'); }
 
-  function deleteProduct(id) {
-    toast('Products are deleted in Admin.');
-    return;
-    if (!requireOwner('delete products')) return;
-    const product = getProductById(id);
-    if (!product) return;
-    if (!confirm(`Delete product "${product.name}"?`)) return;
-    state.products = state.products.filter(p => p.id !== id);
-    // remove references from active and historical orders? keep historical snapshots intact
-    saveState();
-    persistBusinessMutation();
-    renderAll();
-    renderAdmin();
-    toast('Product deleted.');
-  }
+  function deleteProduct(id) { toast('Products are deleted in the Admin Panel.'); }
 
   function moveProduct(id, dir) {
     if (!requireOwner('reorder products')) return;
@@ -5062,36 +5016,14 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     `;
   }
 
-  function newCategory() {
-    state.adminSelection = null;
-    renderAdmin();
-  }
+  function newCategory() { toast('Categories are created in the Admin Panel.'); }
 
   function editCategory(id) {
     state.adminSelection = id;
     renderAdmin();
   }
 
-  function saveCategory() {
-    if (!requireOwner('modify categories')) return;
-    const name = $('c_name').value.trim();
-    if (!name) return toast('Category name is required.');
-    const order = Number($('c_order').value || state.categories.length + 1);
-    const active = $('c_active').value === 'true';
-    if (state.adminSelection) {
-      const existing = state.categories.find(c => c.id === state.adminSelection);
-      if (existing) Object.assign(existing, { name, order, active });
-    } else {
-      state.categories.push({ id: uid('cat'), name, order, active });
-    }
-    state.categories.sort((a,b) => a.order - b.order);
-    state.adminSelection = null;
-    saveState();
-    persistBusinessMutation();
-    renderAll();
-    renderAdmin();
-    toast('Category saved.');
-  }
+  function saveCategory() { toast('Categories are managed in the Admin Panel.'); }
 
   function moveCategory(id, dir) {
     if (!requireOwner('reorder categories')) return;
@@ -5106,22 +5038,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
     renderCategories();
   }
 
-  function deleteCategory(id) {
-    if (!requireOwner('delete categories')) return;
-    const cat = state.categories.find(c => c.id === id);
-    if (!cat) return;
-    if (state.products.some(p => p.categoryId === id)) {
-      toast('Move products out of this category before deleting.');
-      return;
-    }
-    if (!confirm(`Delete category "${cat.name}"?`)) return;
-    state.categories = state.categories.filter(c => c.id !== id);
-    state.adminSelection = null;
-    saveState();
-    persistBusinessMutation();
-    renderAll();
-    renderAdmin();
-  }
+  function deleteCategory(id) { toast('Categories are deleted in the Admin Panel.'); }
 
   function renderTablesAdmin(list, editor) {
     list.innerHTML = `
@@ -5939,6 +5856,7 @@ setPersistence(auth, browserLocalPersistence).catch((err) => console.warn('Fireb
   function newSupplierPurchase() {
     state.supplierPaymentSelection = null;
     state.adminSelection = null;
+    if (state.adminTab === 'products' || state.adminTab === 'categories' || state.adminTab === 'finance') state.adminTab = 'recipes';
     if (state.adminTab === 'finance') state.financeSubtab = 'supplier';
     else state.adminTab = 'supplierPayments';
     renderAdmin();
